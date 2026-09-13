@@ -1,9 +1,21 @@
 # docker-vm
 
-A planned GPU-accelerated Linux desktop in Docker, accessed remotely through
-Moonlight. The proposed stack uses Games on Whales Wolf, Sway, and Chromium.
+A GPU-accelerated Linux desktop in Docker, accessed with Moonlight. The stack
+uses Games on Whales Wolf, Sway, and Chromium; it is a container desktop, not a
+virtual machine.
 
-Read [DESIGN.md](DESIGN.md) for the architecture, implementation plan, and
-performance acceptance criteria.
+Start with [setup and validation](docs/SETUP.md), then read [DESIGN.md](DESIGN.md)
+for architecture and [benchmark rules](docs/BENCHMARKS.md) before making a
+performance claim.
 
-**Status:** design only. No runnable deployment or benchmark results yet.
+```bash
+./scripts/preflight
+./scripts/configure
+./scripts/build
+docker compose -f compose.yaml -f compose.nvidia.yaml up -d
+# pair from Moonlight, then:
+./scripts/doctor --wolf docker-vm-wolf --desktop <live-worker-name> --strict
+```
+
+`doctor --strict` deliberately fails when evidence is missing. Browser rendering,
+browser media decoding, server encoding, and client decoding are separate gates.

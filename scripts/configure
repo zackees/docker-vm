@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=${DOCKER_VM_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
+env_file="$root/.env"
+template="$root/config/wolf/config.toml.template"
+seccomp_template="$root/config/wolf/chromium-seccomp.json"
+dev_dri_dir=${DOCKER_VM_DEV_DRI_DIR:-/dev/dri}
+docker_socket=${DOCKER_VM_DOCKER_SOCKET:-/var/run/docker.sock}
+cdi_spec=${DOCKER_VM_CDI_SPEC:-/var/run/cdi/nvidia-container-toolkit.json}
+
+if [[ ${1:-} == "--help" ]]; then
+  cat <<'EOF'
+Usage: scripts/configure
+
+Creates .env and first-run Wolf state without overwriting pairing or profile
+data. NVIDIA access uses Docker CDI and follows the host driver's CDI spec.
+EOF
+  exit 0
+fi
+if [[ $# -ne 0 ]]; then
+  echo "error: unknown option: $1 (try --help)" >&2
+  exit 2
+fi
+for required in docker jq realpath; do
+  command -v "$required" >/dev/null 2>&1 || { echo "error: required command is unavailable: $required" >&2; exit 1; }
+done
+
+if [[ ! -S "$docker_socket" ]]; then
+  echo "error: Docker socket is not available: $docker_socket" >&2
+  exit 1
+fi
+if ! docker info >/dev/null 2>&1; then
+  echo "error: Docker daemon is not reachable" >&2
+  exit 1
+fi
+
+uid=$(id -u)
+gid=$(id -g)
+state_default="$HOME/.local/share/docker-vm/wolf"
+runtime_default="$HOME/.local/state/docker-vm/runtime"
+cdi_default=nvidia.com/gpu=0
+
+if [[ ! -e "$env_file" ]]; then
+  umask 077
+  mkdir -p "$(dirname "$state_default")" "$(dirname "$runtime_default")"
+  cat >"$env_file" <<EOF
+WOLF_STATE_DIR=$state_default
+WOLF_RUNTIME_DIR=$runtime_default
+WOLF_RUN_UID=$uid
+WOLF_RUN_GID=$gid
+WOLF_RENDER_NODE=$dev_dri_dir/renderD128
+NVIDIA_CDI_DEVICE=$cdi_default
+EOF
+  echo "created $env_file"
+fi
+
+declare -A env_values=()
+while IFS= read -r env_line || [[ -n $env_line ]]; do
+  [[ -z $env_line || $env_line == \#* ]] && continue
+  if [[ ! $env_line =~ ^([A-Z_][A-Z0-9_]*)=([^[:space:]]+)$ ]]; then
+    echo "error: .env only accepts literal KEY=value assignments" >&2
+    exit 1
+  fi
+  env_key=${BASH_REMATCH[1]}
+  env_value=${BASH_REMATCH[2]}
+  case "$env_key" in
+    WOLF_STATE_DIR|WOLF_RUNTIME_DIR|WOLF_RUN_UID|WOLF_RUN_GID|WOLF_RENDER_NODE|NVIDIA_CDI_DEVICE) ;;
+    *) echo "error: unsupported .env key: $env_key" >&2; exit 1 ;;
+  esac
+  case "$env_value" in
+    *'$'*|*'`'*|*';'*|*'&'*|*'|'*|*'('*|*')'*|*'{'*|*'}'*|*'<'*|*'>'*|*'\\'*|*"'"*|*'"'*|*'*'*|*'?'*|*'!'*)
+      echo "error: shell metacharacter in $env_key is not allowed" >&2
+      exit 1 ;;
+  esac
+  [[ -z ${env_values[$env_key]+x} ]] || { echo "error: duplicate .env key: $env_key" >&2; exit 1; }
+  env_values[$env_key]=$env_value
+done <"$env_file"
+for env_key in WOLF_STATE_DIR WOLF_RUNTIME_DIR WOLF_RUN_UID WOLF_RUN_GID WOLF_RENDER_NODE NVIDIA_CDI_DEVICE; do
+  [[ -n ${env_values[$env_key]:-} ]] || { echo "error: missing $env_key in .env" >&2; exit 1; }
+  printf -v "$env_key" '%s' "${env_values[$env_key]}"
+done
+for v in WOLF_STATE_DIR WOLF_RUNTIME_DIR WOLF_RUN_UID WOLF_RUN_GID WOLF_RENDER_NODE NVIDIA_CDI_DEVICE; do
+  [[ -n ${!v:-} ]] || { echo "error: $v is empty in .env" >&2; exit 1; }
+done
+for v in WOLF_RUN_UID WOLF_RUN_GID; do
+  [[ ${!v} =~ ^[1-9][0-9]*$ ]] || { echo "error: $v must be a non-root positive integer" >&2; exit 1; }
+done
+[[ $NVIDIA_CDI_DEVICE =~ ^nvidia\.com/gpu=(all|[0-9]+|GPU-[A-Za-z0-9-]+)$ ]] || {
+  echo "error: NVIDIA_CDI_DEVICE must be an exact nvidia.com/gpu= selector" >&2
+  exit 1
+}
+canonical_path() { realpath -m -- "$1"; }
+state_path=$(canonical_path "$WOLF_STATE_DIR")
+runtime_path=$(canonical_path "$WOLF_RUNTIME_DIR")
+home_path=$(canonical_path "$HOME")
+repo_path=$(canonical_path "$root")
+if [[ $state_path != "$home_path/.local/share/docker-vm/"* || $runtime_path != "$home_path/.local/state/docker-vm/"* ]]; then
+  echo "error: state/runtime must be dedicated directories below $HOME/.local/{share,state}/docker-vm" >&2
+  exit 1
+fi
+for dangerous in / /home "$home_path" "$repo_path"; do
+  [[ $state_path != "$dangerous" && $runtime_path != "$dangerous" ]] || { echo "error: refusing broad state/runtime path: $dangerous" >&2; exit 1; }
+done
+WOLF_STATE_DIR=$state_path
+WOLF_RUNTIME_DIR=$runtime_path
+if [[ "$WOLF_RENDER_NODE" != "$dev_dri_dir"/* || ! -r "$WOLF_RENDER_NODE" ]]; then
+  echo "error: WOLF_RENDER_NODE must be a readable render node below $dev_dri_dir" >&2
+  exit 1
+fi
+if [[ ! -r "$cdi_spec" ]] || ! jq -e --arg name "${NVIDIA_CDI_DEVICE#*=}" '.devices[]? | select(.name == $name)' "$cdi_spec" >/dev/null; then
+  echo "error: CDI device $NVIDIA_CDI_DEVICE is not present in $cdi_spec" >&2
+  exit 1
+fi
+
+mkdir -p "$WOLF_STATE_DIR" "$WOLF_RUNTIME_DIR"
+chmod 700 "$WOLF_STATE_DIR"
+# Wolf's embedded PulseAudio runs as root. XDG_RUNTIME_DIR rejects a directory
+# owned by the regular host user, so establish ownership through a one-shot
+# container instead of broadening permissions on a host runtime directory.
+docker run --rm --mount "type=bind,src=$WOLF_RUNTIME_DIR,dst=/runtime" busybox:1.37 chown 0:0 /runtime >/dev/null
+config="$WOLF_STATE_DIR/cfg/config.toml"
+seccomp_profile="$WOLF_STATE_DIR/chromium-seccomp.json"
+mkdir -p "$(dirname "$config")"
+legacy_config="$WOLF_STATE_DIR/config.toml"
+if [[ ! -e "$config" && -e "$legacy_config" ]]; then
+  mv "$legacy_config" "$config"
+  echo "migrated legacy Wolf configuration to $config"
+fi
+if [[ ! -e "$seccomp_profile" ]] || ! cmp -s "$seccomp_template" "$seccomp_profile"; then
+  install -m 600 "$seccomp_template" "$seccomp_profile"
+fi
+if [[ ! -e "$config" ]]; then
+  uuid=$(cat /proc/sys/kernel/random/uuid)
+  seccomp_json=$(jq -c . "$seccomp_profile" | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g')
+  sed -e "s|@WOLF_UUID@|$uuid|g" -e "s|@NVIDIA_CDI_DEVICE@|$NVIDIA_CDI_DEVICE|g" -e "s|@WOLF_RENDER_NODE@|$WOLF_RENDER_NODE|g" -e "s|@CHROMIUM_SECCOMP_JSON@|$seccomp_json|g" "$template" >"$config"
+  chmod 600 "$config"
+  echo "created first-run Wolf configuration: $config"
+else
+  echo "preserved existing Wolf configuration and pairing state: $config"
+fi
+
+echo "ready: ./scripts/build && docker compose -f compose.yaml -f compose.nvidia.yaml up -d"

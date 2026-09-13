@@ -1,0 +1,6 @@
+services:
+  wolf:
+    devices:
+      # Docker Engine >= 28.3 resolves CDI device names and injects the exact
+      # host driver libraries. This pins the controller to one GPU.
+      - ${NVIDIA_CDI_DEVICE:?run scripts/configure first}

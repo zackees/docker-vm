@@ -1,6 +1,10 @@
 # docker-vm design
 
-Status: proposed architecture; implementation and hardware benchmarks pending.
+Status: NVIDIA reference profile implemented. An earlier Google Chrome desktop
+bring-up completed on the reference NixOS host; the final Debian Chromium image
+is built but its live validation is blocked because an external host NVIDIA/CDI
+reconfiguration removed the CDI device specification. Performance and reconnect
+benchmarks remain pending.
 
 ## Purpose and decision
 
@@ -29,6 +33,8 @@ Required behavior:
 - Open, resize, and switch between multiple Chromium windows and dialogs.
 - Preserve browser profiles, downloads, and desktop settings across recreation.
 - Support audio playback, normal typing, scrolling, and browser shortcuts.
+- Preserve ordinary absolute mouse behavior: never warp, trap, confine, or hide
+  the pointer as a side effect of streaming.
 - Diagnose missing GPU acceleration rather than silently calling a software
   fallback a successful accelerated setup.
 - Leave the host desktop usable independently.
@@ -71,10 +77,10 @@ has to be verified; same-GPU selection alone does not prove zero-copy execution.
 
 ## Host and GPU contract
 
-Target native Linux Docker Engine with Compose v2. Initial reference host:
-Ubuntu 24.04 LTS, subject to GPU driver support. Start from a pinned upstream GoW
-application base compatible with the pinned Wolf release; the container's distro
-does not need to match the host's. Do not add a Docker Desktop VM layer.
+Target native Linux Docker Engine with Compose v2. The implemented reference host
+is NixOS Linux x86_64 with NVIDIA CDI. The worker is a coherent pinned Debian 13
+runtime that copies the pinned upstream GoW lifecycle/compositor scripts; it does
+not share the host distribution and does not add a Docker Desktop VM layer.
 
 A preflight command must report host/kernel, Docker context, GPU PCI identity,
 driver, render-node mapping, container device permissions, and encoder support.
@@ -97,10 +103,15 @@ a kernel GPU driver inside the image. Map only the selected GPU where supported.
 
 ## Browser and desktop runtime
 
-Run Chromium as a regular user, with `--ozone-platform=wayland`, and retain the
-browser sandbox. Avoid `--no-sandbox`, `--disable-gpu`, and blanket GPU-blocklist
-overrides as deployment defaults. If sandbox initialization fails, diagnose the
-image, user namespaces, seccomp, and host policy before changing isolation.
+Run maintained open-source Chromium as a regular user, with
+`--ozone-platform=wayland`, and retain the browser sandbox. The final worker
+must use a non-Snap Chromium package; an earlier Google Chrome bring-up is not
+the shipped browser implementation. Avoid `--no-sandbox`, `--disable-gpu`, and blanket
+GPU-blocklist overrides as deployment defaults. The Docker default seccomp
+profile blocked the earlier Chrome bring-up's namespace setup on the reference host; the worker uses
+a narrow profile that permits `clone`, `unshare`, and `setns` while retaining
+the other Docker restrictions. The earlier Chrome renderer inspection confirmed
+`NoNewPrivs: 1` and two seccomp filters; repeat this proof for final Chromium.
 
 Use a maintained browser package that works without a host Snap service. Pin the
 desktop image for reproducibility and rebuild regularly for browser security
@@ -163,12 +174,13 @@ Desired default: disconnecting the client leaves the desktop alive, and reconnec
 reattaches to that session. Explicit stop gracefully ends the browser and desktop.
 Host reboot restores saved data, not process memory.
 
-Upstream defaults to stopping/removing the app container at disconnect and exposes
-`WOLF_STOP_CONTAINER_ON_EXIT` to change that. Set it to false for the persistence
-experiment, but treat live reconnect, compositor survival, resource cleanup, and
-duplicate-session prevention as an implementation gate. If the pinned release
-cannot preserve a complete live session, document that limitation and offer
-restart-with-profile persistence; do not describe it as seamless resume.
+Wolf pauses a session on disconnect and stops it on explicit cancellation.
+`WOLF_STOP_CONTAINER_ON_EXIT` controls whether the stopped app container is
+removed; it does not itself guarantee a live compositor survives reconnect.
+Treat live reconnect, compositor survival, resource cleanup, and duplicate-session
+prevention as implementation gates. If the pinned release cannot preserve a
+complete live session, document that limitation and offer restart-with-profile
+persistence; do not describe it as seamless resume.
 [Wolf lifecycle and configuration](https://games-on-whales.github.io/wolf/stable/user/configuration.html)
 
 Back up browser data while the browser is stopped, or use a consistent filesystem
@@ -193,16 +205,24 @@ Keep pairing/administration restricted to those networks, and exclude credential
 and certificates from Git. Use WireGuard or Tailscale for off-site access; verify
 a direct connection because a relay can materially affect responsiveness.
 
+The desktop must use normal windowed absolute pointer behavior: it must not
+grab, confine, or hide the host/client mouse merely because the stream is active.
+Any input mode that changes this is a regression unless explicitly selected by
+the trusted user.
+
 ## Proposed repository layout
 
-Only this design and the initial README are implemented at this stage. The planned
-files below describe the implementation, not commands that already work.
+The NVIDIA reference implementation includes the files below. Its Wolf, GoW
+script source, and Debian runtime bases are digest-pinned; locally built wrapper
+tags are intentionally used by Compose because the CUDA/GLVND additions are
+host-profile-specific.
 
 ```text
 compose.yaml                 # Wolf controller and persistent state
 compose.nvidia.yaml          # Validated NVIDIA-specific integration
 .env.example                 # GPU selection and state paths; no secrets
 images/desktop/Dockerfile    # Pinned GoW base, Chromium and desktop tools
+images/wolf/Dockerfile       # Pinned Wolf plus minimal NVRTC runtime wrapper
 config/wolf/                 # Templates; runtime pairing state lives elsewhere
 config/sway/                 # Floating-friendly desktop and shortcuts
 scripts/preflight           # Read-only dependency/GPU diagnostics
@@ -215,6 +235,31 @@ docs/BENCHMARKS.md          # Hardware, versions, measurements and limitations
 Pin controller and base images by digest after the first successful integration.
 Store exact versions in benchmark results. Configuration generation must preserve
 runtime pairing state and refuse accidental profile-directory reuse.
+
+### Reference-host implementation notes
+
+The tested host is NixOS x86_64 with an NVIDIA RTX 3060 and driver 595.71.05.
+It uses Docker CDI device `nvidia.com/gpu=0`, not the Docker `--gpus` path and
+not a copied host driver volume. This profile is NVIDIA-specific: its GBM,
+GLVND, and NVRTC settings must not be described as validated Intel or AMD
+support.
+
+The CDI mount supplies the NVIDIA driver libraries and GBM backend. The wrapper
+also installs the minimal Ubuntu Plucky runtime package
+`libnvrtc12=12.2.140~12.2.2-2build1`, whose package dependency supplies
+`libnvrtc-builtins12.2`, and provides the unversioned NVRTC loader aliases
+required by Wolf's GStreamer CUDA plugin. NVIDIA GLVND and external-platform
+JSON is installed in the images because the CDI-mounted NixOS JSON contains
+host-only store paths; the images select their valid `/usr/share` manifests.
+
+Observed bring-up evidence: Wolf selected `nvcodec` for H.264 and H.265 and
+reported its NVIDIA zero-copy pipeline. A CDI smoke pipeline using
+`cudaupload ! cudaconvertscale ! nvh264enc` completed. The earlier browser
+bring-up exposed a 1920x1080 Wayland Sway output and a visible floating browser
+window using the selected `/dev/dri/renderD128`; it must be repeated with the
+shipped Chromium worker. These observations do not
+measure throughput, latency, browser video decode, or prove end-to-end
+zero-copy; those remain acceptance work.
 
 ## Implementation and acceptance gates
 

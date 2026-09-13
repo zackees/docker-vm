@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Runtime evidence collector. It never treats absence of evidence as acceleration.
+set -u -o pipefail
+desktop="${DESKTOP_CONTAINER:-desktop}"
+wolf="${WOLF_CONTAINER:-docker-vm-wolf}"
+strict=0
+evidence=""
+while (($#)); do
+  case "$1" in
+    --desktop|--wolf|--evidence)
+      [[ $# -ge 2 ]] || { echo "missing value for $1" >&2; exit 2; }
+      case "$1" in --desktop) desktop="$2";; --wolf) wolf="$2";; --evidence) evidence="$2";; esac
+      shift 2;;
+    --strict) strict=1; shift;;
+    -h|--help) echo "usage: $0 [--desktop NAME] [--wolf NAME] [--evidence FILE] [--strict]"; exit 0;;
+    *) echo "unknown option: $1" >&2; exit 2;;
+  esac
+done
+bad=0; unknown=0
+pass() { printf 'PASS  [%s] %s\n' "$1" "$2"; }
+fail() { printf 'FAIL  [%s] %s\n' "$1" "$2"; bad=1; }
+gap() { printf 'GAP   [%s] %s\n' "$1" "$2"; unknown=1; }
+exists() { docker inspect "$1" >/dev/null 2>&1; }
+running() { [[ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" == true ]]; }
+evidence_value() { [[ -n "$evidence" && -r "$evidence" ]] && sed -n "s/^$1=//p" "$evidence" | tail -1 || true; }
+printf 'docker-vm doctor: four independent acceleration layers\n'
+printf 'A browser GPU renderer, browser media decode, stream encode, and client decode each require their own proof.\n'
+if ! docker info >/dev/null 2>&1; then fail host "Docker daemon unreachable"; exit 1; fi
+if exists "$desktop" && running "$desktop"; then
+  pass desktop "container $desktop is running"
+  devs="$(docker inspect -f '{{range .HostConfig.Devices}}{{.PathOnHost}} {{end}}' "$desktop")"
+  [[ "$devs" == *'/dev/dri/renderD'* ]] && pass render "desktop maps DRM render node: $devs" || gap render "desktop has no explicit DRM render-node mapping (NVIDIA runtime may inject libraries instead)"
+  envs="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$desktop")"
+  printf '%s\n' "$envs" | grep -qiE 'LIBGL_ALWAYS_SOFTWARE=1|GALLIUM_DRIVER=llvmpipe|--disable-gpu|--no-sandbox' && fail render "software/unsafe browser override is configured" || true
+  gpu="$(docker exec "$desktop" sh -lc 'nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null || true' 2>/dev/null)"
+  [[ -n "$gpu" ]] && pass render "desktop sees NVIDIA GPU: $gpu" || gap render "cannot prove GPU visibility in desktop container (nvidia-smi unavailable or inaccessible)"
+  browser="$(docker exec "$desktop" sh -lc 'chromium --version 2>/dev/null || true' 2>/dev/null)"
+  [[ -n "$browser" ]] && pass browser "browser binary present: $browser" || gap browser "browser binary was not found in the running desktop container"
+  [[ "$(evidence_value DESKTOP_VISIBLE)" == PASS ]] && pass desktop "visible streamed Sway/Chromium evidence recorded in $evidence" || gap desktop "visible Sway/Chromium verification requires the worker user's SWAYSOCK and streamed tree evidence; record DESKTOP_VISIBLE=PASS after observation (process presence alone is not a visible-desktop pass)"
+  sandbox="$(docker exec "$desktop" sh -lc 'stat -c "%a %U %G" /usr/lib/chromium/chrome-sandbox 2>/dev/null || true' 2>/dev/null)"
+  [[ "$sandbox" == '4755 root root' ]] && pass browser "Chromium sandbox helper has expected 4755 root:root mode" || gap browser "Chromium sandbox helper mode is not verified as 4755 root:root"
+  [[ "$(evidence_value BROWSER_RENDER)" == PASS ]] && pass browser "visible chrome://gpu evidence recorded in $evidence" || gap browser "inspect chrome://gpu in streamed visible browser; record BROWSER_RENDER=PASS in an evidence file after checking renderer/compositing/WebGL"
+  [[ "$(evidence_value BROWSER_DECODE)" == PASS ]] && pass decode "media-internals evidence recorded in $evidence" || gap decode "inspect chrome://media-internals during known hardware-decodable video; record BROWSER_DECODE=PASS after checking"
+else
+  gap desktop "desktop container '$desktop' is not running; use --desktop with the live Wolf worker name"
+  gap render "no worker render evidence"; gap browser "no visible Chromium evidence"; gap decode "no browser media-decode evidence"
+fi
+if exists "$wolf" && running "$wolf"; then
+  pass stream "controller $wolf is running"
+  wg="$(docker exec "$wolf" sh -lc 'nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null || true' 2>/dev/null)"
+  [[ -n "$wg" ]] && pass stream "controller sees NVIDIA GPU: $wg" || gap stream "controller GPU visibility not proven"
+  logs="$(docker logs --tail 300 "$wolf" 2>&1 || true)"
+  if printf '%s' "$logs" | grep -qiE 'using[[:space:]]+h264[[:space:]]+encoder:[[:space:]]*(nvcodec|nvenc)|using[[:space:]]+nvenc|nvenc[^[:alnum:]]*(initialized|started)|hardware encoder.*(active|selected)'; then pass encode "recent controller log records active H.264 hardware encoder"; else gap encode "no active NVENC/nvcodec H.264 success evidence in recent controller logs"; fi
+  if printf '%s' "$logs" | grep -qiE 'using[[:space:]]+h264[[:space:]]+encoder:[[:space:]]*(x264|software)|software h264 encoder (detected|active|selected)'; then fail encode "controller logs indicate active H.264 software fallback"; fi
+else
+  gap stream "controller '$wolf' is not running; use --wolf with the live controller name"; gap encode "no stream encoder evidence"
+fi
+[[ "$(evidence_value CLIENT_DECODE)" == PASS ]] && pass client "Moonlight Statistics evidence recorded in $evidence" || gap client "Moonlight Statistics must show negotiated codec, hardware decoder, decode time and drops; record CLIENT_DECODE=PASS only after observation"
+printf '\nResult: '
+if ((bad)); then printf 'FAIL: explicit fallback or unsafe configuration detected.\n'; exit 1; fi
+if ((unknown)); then
+  if ((strict)); then printf 'INCOMPLETE: strict mode rejects missing acceleration evidence.\n'; exit 1; fi
+  printf 'INCOMPLETE unless every GAP is replaced by recorded live evidence.\n'
+else
+  printf 'PASS: all configured evidence gates are present.\n'
+fi

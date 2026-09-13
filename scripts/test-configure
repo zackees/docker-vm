@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+mkdir -p "$tmp/repo/config" "$tmp/bin" "$tmp/dri"
+cp -R "$repo/config/wolf" "$tmp/repo/config/"
+cp "$repo/scripts/configure" "$tmp/repo/configure"
+touch "$tmp/dri/renderD128"
+cat >"$tmp/cdi.json" <<'EOF'
+{"devices":[{"name":"0"}]}
+EOF
+cat >"$tmp/bin/docker" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in info|run) exit 0;; *) echo "unexpected docker command: $*" >&2; exit 1;; esac
+EOF
+chmod +x "$tmp/bin/docker"
+python3 - "$tmp/docker.sock" <<'PY' &
+import socket, sys, time
+s = socket.socket(socket.AF_UNIX)
+s.bind(sys.argv[1])
+time.sleep(30)
+PY
+socket_pid=$!
+trap 'kill "$socket_pid" 2>/dev/null || true; rm -rf "$tmp"' EXIT
+for _ in {1..50}; do
+  [[ -S "$tmp/docker.sock" ]] && break
+  sleep 0.01
+done
+[[ -S "$tmp/docker.sock" ]]
+
+env PATH="$tmp/bin:$PATH" HOME="$tmp/home" DOCKER_VM_ROOT="$tmp/repo" \
+  DOCKER_VM_DEV_DRI_DIR="$tmp/dri" DOCKER_VM_CDI_SPEC="$tmp/cdi.json" DOCKER_VM_DOCKER_SOCKET="$tmp/docker.sock" \
+  "$tmp/repo/configure"
+config="$tmp/home/.local/share/docker-vm/wolf/cfg/config.toml"
+python3 - "$config" <<'PY'
+import json, sys, tomllib
+with open(sys.argv[1], 'rb') as f: cfg = tomllib.load(f)
+runner = next(a['runner'] for a in cfg['profiles'][0]['apps'] if a['title'] == 'Desktop')
+create = json.loads(runner['base_create_json'])
+assert create['HostConfig']['ShmSize'] == 2147483648
+assert create['HostConfig']['DeviceRequests'][0]['Driver'] == 'cdi'
+assert 'SYS_ADMIN' not in create['HostConfig']['CapAdd']
+assert '@' not in runner['base_create_json']
+PY
+before=$(sha256sum "$config")
+env PATH="$tmp/bin:$PATH" HOME="$tmp/home" DOCKER_VM_ROOT="$tmp/repo" \
+  DOCKER_VM_DEV_DRI_DIR="$tmp/dri" DOCKER_VM_CDI_SPEC="$tmp/cdi.json" DOCKER_VM_DOCKER_SOCKET="$tmp/docker.sock" \
+  "$tmp/repo/configure" >/dev/null
+test "$before" = "$(sha256sum "$config")"
+if env PATH="$tmp/bin:$PATH" HOME="$tmp/home" DOCKER_VM_ROOT="$tmp/repo" "$tmp/repo/configure" --bad >/dev/null 2>&1; then
+  exit 1
+fi
+printf 'WOLF_STATE_DIR=$(touch>%s/should-not-exist)\n' "$tmp" >"$tmp/repo/.env"
+if env PATH="$tmp/bin:$PATH" HOME="$tmp/home" DOCKER_VM_ROOT="$tmp/repo" \
+  DOCKER_VM_DEV_DRI_DIR="$tmp/dri" DOCKER_VM_CDI_SPEC="$tmp/cdi.json" DOCKER_VM_DOCKER_SOCKET="$tmp/docker.sock" \
+  "$tmp/repo/configure" >/dev/null 2>&1; then
+  exit 1
+fi
+test ! -e "$tmp/should-not-exist"
+printf 'HOME=%s\n' "$tmp/other-home" >"$tmp/repo/.env"
+if env PATH="$tmp/bin:$PATH" HOME="$tmp/home" DOCKER_VM_ROOT="$tmp/repo" \
+  DOCKER_VM_DEV_DRI_DIR="$tmp/dri" DOCKER_VM_CDI_SPEC="$tmp/cdi.json" DOCKER_VM_DOCKER_SOCKET="$tmp/docker.sock" \
+  "$tmp/repo/configure" >/dev/null 2>&1; then
+  exit 1
+fi
+cat >"$tmp/repo/.env" <<EOF
+WOLF_STATE_DIR=$tmp/home
+WOLF_RUNTIME_DIR=$tmp/home/.local/state/docker-vm/runtime
+WOLF_RUN_UID=1000
+WOLF_RUN_GID=1000
+WOLF_RENDER_NODE=$tmp/dri/renderD128
+NVIDIA_CDI_DEVICE=nvidia.com/gpu=0
+EOF
+if env PATH="$tmp/bin:$PATH" HOME="$tmp/home" DOCKER_VM_ROOT="$tmp/repo" \
+  DOCKER_VM_DEV_DRI_DIR="$tmp/dri" DOCKER_VM_CDI_SPEC="$tmp/cdi.json" DOCKER_VM_DOCKER_SOCKET="$tmp/docker.sock" \
+  "$tmp/repo/configure" >/dev/null 2>&1; then
+  exit 1
+fi
+cat >"$tmp/repo/.env" <<EOF
+WOLF_STATE_DIR=$tmp/home/.local/share/docker-vm/wolf
+WOLF_RUNTIME_DIR=$tmp/home/.local/state/docker-vm/runtime
+WOLF_RUN_UID=0
+WOLF_RUN_GID=1000
+WOLF_RENDER_NODE=$tmp/dri/renderD128
+NVIDIA_CDI_DEVICE=not-nvidia=0
+EOF
+if env PATH="$tmp/bin:$PATH" HOME="$tmp/home" DOCKER_VM_ROOT="$tmp/repo" \
+  DOCKER_VM_DEV_DRI_DIR="$tmp/dri" DOCKER_VM_CDI_SPEC="$tmp/cdi.json" DOCKER_VM_DOCKER_SOCKET="$tmp/docker.sock" \
+  "$tmp/repo/configure" >/dev/null 2>&1; then
+  exit 1
+fi
+echo "configure behavioral test: PASS"

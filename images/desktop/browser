@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${CHROMIUM_USER_DATA_DIR:?CHROMIUM_USER_DATA_DIR must be set}"
+mkdir -p "$CHROMIUM_USER_DATA_DIR" "$HOME/Downloads"
+
+exec /usr/bin/chromium \
+  --ozone-platform=wayland \
+  --enable-features=UseOzonePlatform \
+  --user-data-dir="$CHROMIUM_USER_DATA_DIR" \
+  "$@"

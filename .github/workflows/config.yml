@@ -1,0 +1,21 @@
+name: configuration
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate first-run configuration without a GPU
+        run: ./scripts/test-configure
+      - name: Validate diagnostics behavior
+        run: ./tests/validation.sh
+      - name: Validate shell syntax
+        run: find scripts -maxdepth 1 -type f -print0 | xargs -0 bash -n

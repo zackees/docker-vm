@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Keep the compositor session useful after a normal browser quit. Chromium's
+# profile lock is released before this restart and the worker owns one profile.
+browser_pid=""
+stopping=0
+
+stop() {
+  stopping=1
+  if [ -n "$browser_pid" ] && kill -0 "$browser_pid" 2>/dev/null; then
+    kill -TERM "$browser_pid"
+    wait "$browser_pid" || true
+  fi
+  exit 0
+}
+trap stop TERM INT
+
+failures=0
+while true; do
+  /usr/local/bin/browser about:blank &
+  browser_pid=$!
+  started_at=$(date +%s)
+  status=0
+  wait "$browser_pid" || status=$?
+  browser_pid=""
+  [ "$stopping" -eq 0 ] || exit 0
+  runtime=$(( $(date +%s) - started_at ))
+  if [ "$runtime" -lt 5 ]; then
+    failures=$((failures + 1))
+    delay=$((failures * 2))
+    [ "$delay" -le 30 ] || delay=30
+    echo "Chromium exited status=${status} after ${runtime}s; retrying in ${delay}s" >&2
+    sleep "$delay"
+  else
+    failures=0
+    sleep 1
+  fi
+done

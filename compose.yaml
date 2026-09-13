@@ -1,0 +1,39 @@
+name: docker-vm
+
+services:
+  wolf:
+    # Local wrapper: upstream Wolf pinned by images/wolf/Dockerfile, plus the
+    # exact NVRTC runtime needed by the tested NVENC pipeline.
+    image: docker-vm-wolf:local
+    container_name: docker-vm-wolf
+    network_mode: host
+    restart: unless-stopped
+    stop_grace_period: 45s
+    environment:
+      # The GoW entrypoint converts this into /etc/wolf/cfg/config.toml;
+      # Wolf resolves this mounted container path back to host state.
+      HOST_APPS_STATE_FOLDER: /etc/wolf
+      WOLF_DEFAULT_RUN_UID: ${WOLF_RUN_UID:?run scripts/configure first}
+      WOLF_DEFAULT_RUN_GID: ${WOLF_RUN_GID:?run scripts/configure first}
+      WOLF_RENDER_NODE: ${WOLF_RENDER_NODE:?run scripts/configure first}
+      WOLF_STOP_CONTAINER_ON_EXIT: "FALSE"
+      XDG_RUNTIME_DIR: /tmp/sockets
+      # Prefer the image's native EGL external-platform manifests over CDI's
+      # host-Nix paths, which are not meaningful in this Debian image.
+      __EGL_EXTERNAL_PLATFORM_CONFIG_DIRS: /usr/share/egl/egl_external_platform.d
+      GBM_BACKEND: nvidia-drm
+      GBM_BACKENDS_PATH: /usr/local/nvidia/lib/gbm
+    volumes:
+      - ${WOLF_STATE_DIR:?run scripts/configure first}:/etc/wolf:rw
+      - ${WOLF_RUNTIME_DIR:?run scripts/configure first}:/tmp/sockets:rw
+      # Wolf is the trusted lifecycle controller. Workers never receive this socket.
+      - /var/run/docker.sock:/var/run/docker.sock:rw
+      # Required by Wolf for dynamically-created virtual input devices.
+      - /dev:/dev:rw
+      - /run/udev:/run/udev:rw
+    devices:
+      - /dev/dri:/dev/dri
+      - /dev/uinput:/dev/uinput
+      - /dev/uhid:/dev/uhid
+    device_cgroup_rules:
+      - "c 13:* rmw"

@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+while true; do
+  date '+%a %F  %T'
+  sleep 1
+done
