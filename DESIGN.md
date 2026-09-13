@@ -64,6 +64,17 @@ preflight is an eligibility check, not a defense against an administrator.
 
 ## Lifecycle
 
+The browser runs under a main-process GDB supervisor. Any browser exit
+captures a bounded (2 MiB) report in the container's runtime tmpfs and leaves
+Xfce/Xvnc running for inspection; it does not restart the browser. A notification
+warns that closing the viewer destroys the diagnostics. Locals/frame arguments,
+core dumps, automatic report exports and debugger symbol downloads are disabled.
+Live, bounded output/resource snapshots are retained in the same tmpfs so a tab
+failure that leaves the browser alive can be investigated. The task limit is
+2048, counting both threads and processes. Reports remain potentially sensitive
+and require review before sharing. Renderer
+crashes and host/container loss are outside this main-process capture boundary.
+
 Each launch creates a UUID-scoped Compose project. Viewer close stops/removes
 only that project and signals the loopback bridge to close. Container loss makes
 the bridge fail; there is no reconnect. Docker-daemon loss cannot guarantee

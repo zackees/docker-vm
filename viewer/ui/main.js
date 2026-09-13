@@ -43,6 +43,7 @@ try {
   rfb.viewOnly = false;
   rfb.addEventListener('connect', () => document.documentElement.classList.add('connected'));
   rfb.addEventListener('disconnect', event => {
+    document.documentElement.classList.remove('connected');
     status.textContent = event.detail.clean ? 'Session ended.' : 'Session lost; refusing reconnect.';
   });
 } catch (_) {

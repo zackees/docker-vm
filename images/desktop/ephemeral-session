@@ -37,7 +37,7 @@ display-scale --prepare
 dbus-run-session -- sh -c '
   startxfce4 &
   display-scale &
-  exec chromium \
+  exec crash-watch /usr/lib/chromium/chromium \
     --user-data-dir="$CHROMIUM_USER_DATA_DIR" \
     --no-first-run --no-default-browser-check --disable-gpu \
     about:blank

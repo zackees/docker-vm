@@ -1,0 +1,160 @@
+#!/usr/bin/python3
+"""Capture browser-process crashes to bounded tmpfs diagnostics; no core dumps."""
+import os
+import json
+from pathlib import Path
+import resource
+import selectors
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+MAX_REPORT_BYTES = 2 * 1024 * 1024
+
+
+class Diagnostics:
+    """Bounded, volatile snapshots even when the browser survives a failure."""
+    def __init__(self, directory: Path, cgroup: Path = Path('/sys/fs/cgroup')):
+        self.directory = directory
+        self.cgroup = cgroup
+        self.last_write = 0.0
+        self.events = []
+        self.previous = None
+        self.samples = []
+        self.minimum_available = {}
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(directory, 0o700)
+
+    def write(self, name: str, contents: bytes) -> None:
+        temporary = self.directory / f'{name}.next'
+        with temporary.open('wb') as output:
+            os.chmod(temporary, 0o600)
+            output.write(contents)
+        temporary.replace(self.directory / name)
+
+    def poll(self, tail: bytes | None = None, force: bool = False) -> None:
+        if not force and time.monotonic() - self.last_write < 1:
+            return
+        self.last_write = time.monotonic()
+        snapshot = {'time': time.time()}
+        for name in ['pids.current', 'pids.max', 'pids.peak', 'pids.events',
+                     'memory.current', 'memory.max', 'memory.events']:
+            try:
+                snapshot[name] = (self.cgroup / name).read_text().strip()
+            except OSError:
+                snapshot[name] = 'unavailable'
+        for path in ['/dev/shm', '/tmp', '/home/desktop']:
+            try:
+                usage = os.statvfs(path)
+                snapshot[path] = {'available_bytes': usage.f_bavail * usage.f_frsize,
+                                  'total_bytes': usage.f_blocks * usage.f_frsize}
+            except OSError:
+                snapshot[path] = 'unavailable'
+        counters = (snapshot['pids.events'], snapshot['memory.events'])
+        # Filesystem exhaustion has no cgroup event counter. Preserve low-water
+        # marks across recovery and a bounded timeline without browser content.
+        for path in ['/dev/shm', '/tmp', '/home/desktop']:
+            usage = snapshot[path]
+            if isinstance(usage, dict):
+                previous = self.minimum_available.get(path)
+                if previous is None or usage['available_bytes'] < previous['available_bytes']:
+                    self.minimum_available[path] = {'time': snapshot['time'], **usage}
+        self.samples.append(snapshot.copy())
+        self.samples = self.samples[-120:]
+        if counters != self.previous:
+            self.events.append(snapshot.copy())
+            self.events = self.events[-32:]
+            self.previous = counters
+        snapshot['recent_counter_changes'] = self.events
+        snapshot['recent_samples'] = self.samples
+        snapshot['minimum_available'] = self.minimum_available
+        self.write('resources.json', json.dumps(snapshot, indent=2).encode())
+        if tail is not None:
+            self.write('browser-output.log', tail[-MAX_REPORT_BYTES:])
+
+
+def run_debugger(command: list[str], report: Path) -> int:
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    report.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(report.parent, 0o700)
+    # Retain the newest output, which includes the fatal signal and backtrace,
+    # while draining the pipe continuously (browser output cannot block it).
+    tail = bytearray()
+    diagnostics = Diagnostics(report.parent)
+    debugger = subprocess.Popen([
+        'gdb', '--batch', '--quiet', '--nx', '--return-child-result',
+        '-x', '/usr/local/share/browser-backtrace.gdb', '--args', *command,
+    ], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    assert debugger.stdout is not None
+    # Detached Chromium children can inherit this pipe. Do not wait for their
+    # EOF after GDB has exited: the main-process crash is already captured.
+    with selectors.DefaultSelector() as readable:
+        readable.register(debugger.stdout, selectors.EVENT_READ)
+        drain_deadline = None
+        while True:
+            diagnostics.poll(tail)
+            if debugger.poll() is not None:
+                if drain_deadline is None:
+                    drain_deadline = time.monotonic() + 0.5
+                elif time.monotonic() >= drain_deadline:
+                    break
+            if readable.select(timeout=0.2):
+                chunk = debugger.stdout.read1(16384)
+                if not chunk:
+                    break
+                tail.extend(chunk)
+                if len(tail) > MAX_REPORT_BYTES:
+                    del tail[:-MAX_REPORT_BYTES]
+            elif debugger.poll() is not None:
+                break
+    code = debugger.wait()
+    debugger.stdout.close()
+    diagnostics.poll(tail, force=True)
+    with report.open('wb') as output:
+        os.chmod(report, 0o600)
+        output.write(tail)
+    return code
+
+
+def main() -> int:
+    os.umask(0o077)
+    report = Path(os.environ['XDG_RUNTIME_DIR']) / 'crash/browser-backtrace.log'
+    command = sys.argv[1:]
+    if command == ['--resources-only']:
+        diagnostics = Diagnostics(report.parent)
+        while True:
+            diagnostics.poll()
+            time.sleep(1)
+    if not command:
+        raise SystemExit('usage: crash-watch PROGRAM [ARGUMENTS...]')
+    try:
+        code = run_debugger(command, report)
+    except OSError as error:
+        report.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        report.write_text(f'Debugger could not start: {error}\n')
+        code = 127
+    # Keep dbus, Xfce, Xvnc and their tmpfs mounts alive for inspection. Do not
+    # restart Chromium or export diagnostics automatically. Closing the native
+    # viewer still tears down the session and destroys these reports.
+    stopped = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stopped.set())
+    signal.signal(signal.SIGINT, lambda *_: stopped.set())
+    try:
+        subprocess.Popen([
+            'xmessage', '-center', '-title', 'Browser closed' if code == 0 else 'Browser crash captured',
+            '-buttons', 'Keep desktop open:0',
+            ('Chromium closed.' if code == 0 else 'Chromium stopped unexpectedly.') +
+            ' A RAM-only debugger report is at:\n' +
+            f'{report}\n\nKeep this viewer open until the report is inspected.\n'
+            'Closing the viewer destroys the session and its diagnostics.',
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass  # Report remains inspectable even if the notification fails.
+    stopped.wait()
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

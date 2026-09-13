@@ -21,6 +21,71 @@ compromised administrator, or the absence of all OS operational metadata.
 Strict host policy—including no disk-backed swap/hibernation/crash dumping—is
 checked separately and must be satisfied before making the diskless claim.
 
+### Crash diagnostics
+
+Chromium's main process runs under batch GDB. On browser exit or a fatal
+signal, a report is saved to `/run/user/1000/crash/browser-backtrace.log` inside
+the container, and the desktop remains running with a notification. **Keep the
+viewer open until you have inspected the report**: closing it destroys the
+container and its RAM-only diagnostics. No browser restart happens automatically.
+Normal browser closure also leaves the desktop and reports available.
+
+While Chromium is running, `crash/browser-output.log` retains the newest 2 MiB
+of output and `crash/resources.json` records task/memory counters and filesystem
+space once per second, with the last 32 counter changes, 120 recent samples,
+and filesystem free-space low-water marks since monitoring started. These RAM-only snapshots
+help diagnose tab/resource failures that do not terminate the main process.
+The container allows 2048 tasks (threads count too); the former 512-task limit
+was exhausted by a 48-tab synthetic test. The same test at 2048 loaded all 48
+tabs with 987 tasks and no task-limit or OOM events on the validation host.
+Private shared memory has a 2 GiB ceiling (allocated on demand). A 24-tab
+4096×4096 canvas test produced 18 child-process crash dumps at 512 MiB and
+none at 2 GiB, with no cgroup OOM or task-limit events in either run. This
+raises headroom; it does not make an unlimited number of tabs safe.
+
+Find the live session name with `docker ps --filter name=docker-vm`, then inspect:
+
+```bash
+docker exec <session-container> cat /run/user/1000/crash/browser-backtrace.log
+```
+
+The report retains at most the last 2 MiB of debugger/browser output, including
+up to 32 frames per thread and shared-library load addresses. Locals and frame
+arguments are omitted, but reports can still contain sensitive data; inspect
+privately and do not upload them unreviewed. Docker logging stays disabled, core
+dumps are disabled, and no crash-upload or symbol-download service is enabled
+by this wrapper. It does not disable Chromium's sandbox or add ptrace privileges.
+
+This captures the **main browser process**, not every sandboxed renderer crash,
+host OOM/SIGKILL, viewer crash, or container/daemon loss. Distribution Chromium
+is stripped: some frames are addresses rather than function names; full source
+symbolization requires matching debug symbols. Reports do not survive a host
+restart or container stop. GDB adds some startup/runtime overhead.
+
+To validate capture in an isolated, networkless container after building:
+
+```bash
+docker run --rm -i --network none --read-only --cap-drop ALL \
+  --security-opt seccomp=unconfined --ulimit core=0 \
+  --pids-limit 2048 \
+  --tmpfs /tmp:mode=1777,size=128m \
+  --tmpfs /run/user/1000:uid=1000,gid=1000,mode=700,size=64m \
+  --tmpfs /home/desktop:uid=1000,gid=1000,mode=700,size=128m \
+  --shm-size 256m --entrypoint python3 docker-vm-desktop:local \
+  - < tests/crash-capture.py
+```
+
+The test covers SIGTRAP/SIGABRT/SIGSEGV capture, bounded private reports, normal
+exit, harmless SIGCONT delivery, and preserving a real Chromium crash report
+while the supervisor lives.
+`tests/tab-stress.py` is a separate synthetic multi-site stress test. Run it with
+the same isolated Docker command, a 256 MiB `/tmp`, 2 GiB shared memory and a
+6 GiB memory limit. Its test-only loopback DevTools endpoint is not enabled in
+the interactive desktop application.
+Set `-e STRESS_GRAPHICS=1 -e STRESS_TABS=24` for the canvas workload. The test
+checks child-process crash dumps as well as tab titles: a crashed tab can
+retain its title. Use `--shm-size 512m` to reproduce the previous limit failure.
+
 ## Build and run
 
 ```bash

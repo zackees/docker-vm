@@ -18,8 +18,14 @@ services:
       # Docker's default seccomp policy blocks that namespace setup, while
       # no-new-privileges prevents the setuid helper from doing its job.
       - seccomp=unconfined
-    pids_limit: 512
-    shm_size: 512m
+    # Chromium tabs create processes and many threads. 512 exhausted under a
+    # multi-tab workload; retain a finite guard with room for desktop/debugger.
+    pids_limit: 2048
+    ulimits:
+      core: 0
+    # Graphics-heavy tabs exhausted 512 MiB without a cgroup OOM event.
+    # This is a ceiling, not an upfront allocation; keep shared memory private.
+    shm_size: 2g
     environment:
       HOME: /home/desktop
       XDG_RUNTIME_DIR: /run/user/1000

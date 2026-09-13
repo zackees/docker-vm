@@ -130,8 +130,16 @@ fn write_secret(path: &Path, value: &[u8]) -> Result<(), String> {
   file.write_all(value).and_then(|_| file.write_all(b"\n")).map_err(|error| error.to_string())
 }
 
+// Set by the trusted installed launcher, never exposed as a webview command.
+// Development builds retain their checkout-relative default.
+fn resource_root() -> PathBuf {
+  std::env::var_os("DOCKER_VM_RESOURCE_DIR")
+    .map(PathBuf::from)
+    .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."))
+}
+
 fn compose(project: &str, runtime: &Path, action: &str, args: &[&str]) -> Result<(), String> {
-  let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+  let root = resource_root();
   let status = Command::new("docker")
     .current_dir(root)
     .env("SESSION_RUNTIME_DIR", runtime)
@@ -144,7 +152,7 @@ fn compose(project: &str, runtime: &Path, action: &str, args: &[&str]) -> Result
 }
 
 fn container_vnc_address(project: &str, runtime: &Path) -> Result<SocketAddr, String> {
-  let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+  let root = resource_root();
   for _ in 0..30 {
     let metadata = runtime.metadata().map_err(|error| error.to_string())?;
     let output = Command::new("docker")
