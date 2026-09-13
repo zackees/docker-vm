@@ -1,0 +1,16 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Synthetic physical-pixel test</title>
+<style>body { background: white; color: black; font: 14px sans-serif; } canvas { display: block; }</style>
+<p>Physical-pixel test: small text should be sharp, and every stripe is one framebuffer pixel.</p>
+<canvas id="grid" width="600" height="200"></canvas>
+<script>
+  const canvas = document.querySelector('#grid');
+  canvas.style.width = `${600 / devicePixelRatio}px`;
+  canvas.style.height = `${200 / devicePixelRatio}px`;
+  const context = canvas.getContext('2d');
+  for (let x = 0; x < 600; x++) {
+    context.fillStyle = x % 2 ? '#ffffff' : '#000000';
+    context.fillRect(x, 0, 1, 200);
+  }
+</script>

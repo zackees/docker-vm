@@ -13,12 +13,15 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       chromium chromium-sandbox dbus-x11 dumb-init tigervnc-standalone-server \
-      tigervnc-tools xauth xfce4 xfce4-terminal \
+      tigervnc-tools xauth xfce4 xfce4-terminal python3-gi gir1.2-gtk-3.0 x11-xserver-utils \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --create-home --uid 1000 --shell /bin/bash desktop \
  && install -d -o desktop -g desktop -m 0700 /home/desktop
 
+# Keep frequently edited session/UI files after the stable dependency layer.
 COPY --chmod=0755 images/desktop/ephemeral-session /usr/local/bin/ephemeral-session
+COPY --chmod=0755 images/desktop/display-scale /usr/local/bin/display-scale
+COPY images/desktop/display-scale.desktop /usr/share/applications/display-scale.desktop
 
 USER desktop
 EXPOSE 5900

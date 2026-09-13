@@ -12,8 +12,13 @@ keyboard + absolute pointer -> bridge -> Xvnc
 The WebKitGTK application loads only its packaged `index.html` and a pinned noVNC
 submodule. It is not a general browser for the remote session. It does not
 navigate to remote pages and it exposes no filesystem, shell, Docker, or
-arbitrary-network API to its JavaScript. The sole command returns the live
-session's in-memory connection details.
+arbitrary-network API to its JavaScript. One command returns the live session's
+in-memory connection details. A second accepts only a validated numeric display
+scale (0.5–4), atomically publishing it in the session's verified tmpfs directory.
+The container reads that setting through its existing read-only session mount;
+its DPI widget applies desktop settings or a session-local manual override.
+Framebuffer dimensions independently follow physical webview pixels, capped at
+4K pixel count, without passing remote DOM or browser state across the boundary.
 
 The native bridge binds `127.0.0.1` on an ephemeral port, verifies the expected
 packaged-viewer Origin and a single high-entropy capability carried as a WebSocket

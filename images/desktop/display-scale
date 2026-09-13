@@ -1,0 +1,134 @@
+#!/usr/bin/python3
+"""Volatile container-side DPI controller and single-instance dock widget."""
+import math
+import os
+from pathlib import Path
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
+
+HOST_SCALE = Path('/run/session/display-scale')
+
+
+def valid_scale(value: str) -> float:
+    scale = float(value)
+    if not math.isfinite(scale) or not 0.5 <= scale <= 4:
+        raise ValueError('Scale must be between 50% and 400%')
+    return scale
+
+
+def apply_scale(scale: float) -> None:
+    scale = valid_scale(str(scale))
+    dpi = round(96 * scale)
+    settings = [('xsettings', '/Xft/DPI', dpi),
+                ('xfce4-panel', '/panels/panel-1/size', round(26 * scale)),
+                ('xfce4-panel', '/panels/panel-1/icon-size', round(16 * scale)),
+                ('xfce4-panel', '/panels/panel-2/size', round(48 * scale))]
+    for channel, key, value in settings:
+        # --create also permits updating an existing property.
+        subprocess.run(['xfconf-query', '-c', channel, '-p', key, '-n',
+                        '-t', 'int', '-s', str(value)], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(['xrdb', '-merge'], input=f'Xft.dpi: {dpi}\n', text=True,
+                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(['xrandr', '--dpi', str(dpi)], check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def prepare_dock() -> None:
+    # Each session has a fresh tmpfs home. Add a launcher before Xfce starts;
+    # never rewrite an already initialized user's panel configuration.
+    target = Path(os.environ['XDG_CONFIG_HOME']) / 'xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml'
+    if target.exists():
+        return
+    tree = ET.parse('/etc/xdg/xfce4/panel/default.xml')
+    ids = tree.find("./property[@name='panels']/property[@name='panel-2']/property[@name='plugin-ids']")
+    plugins = tree.find("./property[@name='plugins']")
+    if ids is None or plugins is None:
+        raise RuntimeError('Unsupported Xfce default panel configuration')
+    ET.SubElement(ids, 'value', type='int', value='19')
+    plugin = ET.SubElement(plugins, 'property', name='plugin-19', type='string', value='launcher')
+    items = ET.SubElement(plugin, 'property', name='items', type='array')
+    ET.SubElement(items, 'value', type='string', value='display-scale.desktop')
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tree.write(target, encoding='UTF-8', xml_declaration=True)
+
+
+def widget() -> None:
+    import gi
+    gi.require_version('Gtk', '3.0')
+    from gi.repository import Gio, GLib, Gtk
+
+    class ScaleWidget(Gtk.Application):
+        def __init__(self):
+            super().__init__(application_id='com.dockervm.DisplayScale', flags=Gio.ApplicationFlags.FLAGS_NONE)
+            self.window = None
+            self.last_applied = None
+            self.host_scale = 1.0
+
+        def do_activate(self):
+            if self.window is None:
+                self.hold()  # Closing hides the window, not the DPI watcher.
+                self.window = Gtk.ApplicationWindow(application=self, title='Desktop DPI')
+                self.window.set_keep_above(True)
+                self.window.set_resizable(False)
+                self.window.set_default_size(240, -1)
+                self.window.connect('delete-event', self.hide_to_dock)
+                box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin=10)
+                self.window.add(box)
+                self.auto = Gtk.CheckButton(label='Follow host display')
+                self.auto.set_active(True)
+                box.pack_start(self.auto, False, False, 0)
+                self.percent = Gtk.SpinButton.new_with_range(50, 400, 25)
+                self.percent.set_value(100)
+                self.percent.set_sensitive(False)
+                box.pack_start(self.percent, False, False, 0)
+                self.label = Gtk.Label(label='Waiting for host DPI…')
+                box.pack_start(self.label, False, False, 0)
+                self.auto.connect('toggled', self.auto_changed)
+                self.percent.connect('value-changed', lambda _: self.update())
+                hide = Gtk.Button(label='Hide to dock')
+                hide.connect('clicked', lambda _: self.window.hide())
+                box.pack_start(hide, False, False, 0)
+                GLib.timeout_add(500, self.poll)
+                self.poll()
+            self.window.show_all()
+            self.window.present()
+
+        def hide_to_dock(self, *_):
+            self.window.hide()
+            return True
+
+        def auto_changed(self, *_):
+            self.percent.set_sensitive(not self.auto.get_active())
+            self.update()
+
+        def poll(self):
+            try:
+                self.host_scale = valid_scale(HOST_SCALE.read_text())
+            except (OSError, ValueError):
+                pass  # Retain the last valid setting; the host may still start.
+            self.update()
+            return True
+
+        def update(self):
+            scale = self.host_scale if self.auto.get_active() else self.percent.get_value() / 100
+            if self.auto.get_active() and self.percent.get_value() != round(scale * 100):
+                self.percent.set_value(round(scale * 100))
+            if scale != self.last_applied:
+                try:
+                    apply_scale(scale)
+                    self.last_applied = scale
+                except (OSError, ValueError, subprocess.CalledProcessError):
+                    self.label.set_text('Unable to apply DPI; retrying…')
+                    return
+            self.label.set_text(f'{round(scale * 100)}% · {round(96 * scale)} DPI')
+
+    ScaleWidget().run([])
+
+
+if __name__ == '__main__':
+    if sys.argv[1:] == ['--prepare']:
+        prepare_dock()
+    else:
+        widget()

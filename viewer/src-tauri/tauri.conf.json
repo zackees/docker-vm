@@ -4,6 +4,6 @@
   "version": "0.1.0",
   "identifier": "com.zackees.docker-vm.private-canvas",
   "build": { "frontendDist": "../ui" },
-  "app": { "windows": [] },
+  "app": { "windows": [], "withGlobalTauri": true },
   "bundle": { "active": false, "icon": [] }
 }

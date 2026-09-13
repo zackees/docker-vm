@@ -33,8 +33,10 @@ done
 [[ -S /tmp/.X11-unix/X0 ]] || { echo "Xvnc did not start" >&2; exit 1; }
 
 export DISPLAY=:0
+display-scale --prepare
 dbus-run-session -- sh -c '
   startxfce4 &
+  display-scale &
   exec chromium \
     --user-data-dir="$CHROMIUM_USER_DATA_DIR" \
     --no-first-run --no-default-browser-check --disable-gpu \

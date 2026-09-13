@@ -23,5 +23,7 @@ grep -q '127.0.0.1:0' "$root/viewer/src-tauri/src/session.rs"
 grep -q 'ensure_tmpfs' "$root/viewer/src-tauri/src/session.rs"
 grep -q 'create_new(true)' "$root/viewer/src-tauri/src/session.rs"
 bash -n "$root/scripts/preflight" "$root/images/desktop/ephemeral-session" "$root/scripts/build" "$root/viewer/launch"
+node --test "$root/tests/physical-pixels.mjs"
+python3 "$root/tests/display-scale.py"
 SESSION_RUNTIME_DIR=/tmp SESSION_UID=1000 SESSION_GID=1000 docker compose -f "$root/compose.yaml" config >/dev/null
 echo 'validation behavior tests: PASS'

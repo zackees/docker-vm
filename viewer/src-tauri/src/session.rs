@@ -18,7 +18,7 @@ use tokio::{io::AsyncWriteExt, net::{TcpListener, TcpStream}, sync::watch};
 use tokio_tungstenite::{accept_hdr_async, tungstenite::{handshake::server::{Request, Response}, protocol::Message}};
 use uuid::Uuid;
 
-const VIEWER_ORIGIN: &str = "http://tauri.localhost";
+const VIEWER_ORIGIN: &str = "tauri://localhost";
 
 #[derive(Clone, Serialize)]
 pub struct Connection {
@@ -66,6 +66,19 @@ impl SessionManager {
 
   pub fn connection(&self) -> Option<Connection> {
     self.connection.lock().ok()?.clone()
+  }
+
+  pub fn set_display_scale(&self, scale: f64) -> Result<(), String> {
+    if !scale.is_finite() || !(0.5..=4.0).contains(&scale) {
+      return Err("display scale must be between 0.5 and 4".into());
+    }
+    // Serialize writes with session teardown. Only this numeric setting crosses
+    // the read-only container bind; no shell, Docker, or arbitrary-path API.
+    let live = self.connection.lock().map_err(|_| "session lock unavailable")?;
+    if live.is_none() { return Err("session ended".into()); }
+    let temporary = self.root.join("display-scale.next");
+    fs::write(&temporary, scale.to_string()).map_err(|_| "cannot write display scale")?;
+    fs::rename(temporary, self.root.join("display-scale")).map_err(|_| "cannot publish display scale".into())
   }
 
   pub fn stop(&self) {
