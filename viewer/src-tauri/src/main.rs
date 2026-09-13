@@ -10,11 +10,9 @@ mod session;
 use std::sync::Arc;
 
 use tauri::{RunEvent, WebviewUrl, WebviewWindowBuilder};
-use tauri_runtime_cef::{Cef, SandboxPolicy, SecretStorage, cef::LogSeverity};
 
 use session::{Connection, SessionManager};
 
-#[tauri_runtime_cef::cef_entry_point]
 fn main() {
   let manager = Arc::new(SessionManager::start().unwrap_or_else(|error| {
     eprintln!("private session refused: {error}");
@@ -23,7 +21,7 @@ fn main() {
   let managed = Arc::clone(&manager);
 
   tauri::Builder::default()
-    .runtime(cef_runtime(&manager))
+    .runtime(tauri_runtime_wry::Wry::default())
     .manage(manager)
     .invoke_handler(tauri::generate_handler![connection])
     .setup(|app| {
@@ -31,7 +29,7 @@ fn main() {
         .title("Private desktop canvas")
         .inner_size(1280., 800.)
         .min_inner_size(800., 500.)
-        // Empty request-context cache path: CEF off-the-record mode.
+        // The local viewer is an off-the-record, fixed-function RFB canvas.
         .incognito(true)
         .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
         .on_permission_request(|_, _| tauri::webview::PermissionResponse::Deny)
@@ -39,44 +37,12 @@ fn main() {
       Ok(())
     })
     .build(tauri::generate_context!())
-    .expect("failed to build private CEF viewer")
+    .expect("failed to build private WebKitGTK viewer")
     .run(move |_, event| {
       if matches!(event, RunEvent::Exit) {
         managed.stop();
       }
     });
-}
-
-fn cef_runtime(manager: &SessionManager) -> Cef {
-  // The global root cache still exists in CEF even for an off-the-record
-  // request context. It is created only under the verified tmpfs session dir.
-  Cef::default()
-    .sandbox(SandboxPolicy::Required)
-    .secret_storage(SecretStorage::Mock)
-    .root_cache_path(manager.cef_root())
-    // DISABLE still permits FATAL stderr, hence the launcher must also keep
-    // stderr out of persistent journald/log collectors.
-    .log_severity(LogSeverity::DISABLE)
-    .log_file("/dev/null")
-    .allow_chromium_command_line_args(false)
-    .profile_preference("safebrowsing.enabled", false)
-    .profile_preference("credentials_enable_service", false)
-    .profile_preference("profile.password_manager_leak_detection", false)
-    .profile_preference("autofill.profile_enabled", false)
-    .profile_preference("autofill.credit_card_enabled", false)
-    .profile_preference("printing.enabled", false)
-    .profile_preference("hardware.audio_capture_enabled", false)
-    .profile_preference("hardware.video_capture_enabled", false)
-    .global_preference("devtools.remote_debugging.allowed", false)
-    .command_line_args([
-      ("disable-gpu", None),
-      ("use-gl", Some("swiftshader")),
-      ("use-angle", Some("swiftshader")),
-      ("disable-breakpad", None),
-      ("disable-features", Some("AutofillServerCommunication,MediaRouter")),
-      ("no-first-run", None),
-      ("no-default-browser-check", None),
-    ])
 }
 
 #[tauri::command]

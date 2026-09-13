@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Launch the packaged native viewer only after reporting missing ELF libraries
+# in a user-visible way. The dynamic linker fails before Rust's `main`, so this
+# must remain a small external launcher rather than in-app error handling.
+set -euo pipefail
+
+viewer=${1:-"$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/src-tauri/target/release/docker-vm-viewer"}
+
+fail() {
+  local message=$1
+  message=${message//\\n/$'\n'}
+  if command -v zenity >/dev/null 2>&1; then
+    zenity --error --title='Private desktop viewer cannot start' --text="$message" || true
+  fi
+  printf '%s\n' "$message" >&2
+  exit 127
+}
+
+[[ -x "$viewer" ]] || fail "The private desktop viewer executable is missing:\n$viewer"
+
+missing=$(ldd "$viewer" 2>&1 | awk '/=> not found/{print "• " $1}')
+[[ -z "$missing" ]] || fail "A required shared library is missing:\n$missing\n\nInstall the matching system package, then launch again."
+
+exec "$viewer"

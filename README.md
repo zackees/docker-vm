@@ -1,7 +1,7 @@
 # docker-vm
 
 A Linux-first, ephemeral Chromium desktop. Chromium runs in a CPU-only Xfce
-desktop container; the packaged Tauri/CEF client displays it through a private
+desktop container; the packaged Tauri/WebKitGTK client displays it through a private
 RFB/noVNC canvas. This is a container desktop, not a VM.
 
 The viewer never receives the remote browser DOM, profile, URLs, cookies, or
@@ -28,12 +28,15 @@ git submodule update --init --recursive
 ./scripts/preflight --strict
 ./scripts/build
 cd viewer/src-tauri
-cargo tauri build
+cargo build --release
+cd .. && ./launch
 ```
 
-Launch the bundled `docker-vm-viewer` application. It creates one fresh Docker
-Compose project, an in-memory VNC password, an authenticated loopback bridge,
-and a fresh CEF off-the-record context. Closing it removes only that project.
+Launch the bundled `docker-vm-viewer` application through `viewer/launch`. The
+launcher reports a missing shared library in a native dialog before the dynamic
+loader can fail silently. The viewer creates one fresh Docker Compose project,
+an in-memory VNC password, and an authenticated loopback bridge. Closing it
+removes only that project.
 
 Do not run `docker compose up` by hand: `SESSION_RUNTIME_DIR` is deliberately
 required and is created and verified by the viewer.

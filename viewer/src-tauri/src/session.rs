@@ -64,8 +64,6 @@ impl SessionManager {
     }
   }
 
-  pub fn cef_root(&self) -> PathBuf { self.root.join("cef-root") }
-
   pub fn connection(&self) -> Option<Connection> {
     self.connection.lock().ok()?.clone()
   }

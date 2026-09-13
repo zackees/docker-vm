@@ -14,7 +14,10 @@ services:
     restart: "no"
     cap_drop: ["ALL"]
     security_opt:
-      - no-new-privileges:true
+      # Chromium's own setuid/namespace sandbox creates the renderer sandbox.
+      # Docker's default seccomp policy blocks that namespace setup, while
+      # no-new-privileges prevents the setuid helper from doing its job.
+      - seccomp=unconfined
     pids_limit: 512
     shm_size: 512m
     environment:

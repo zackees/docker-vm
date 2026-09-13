@@ -16,7 +16,7 @@ getrandom = "0.3"
 http = "1"
 serde = { version = "1", features = ["derive"] }
 tauri = { git = "https://github.com/tauri-apps/tauri.git", rev = "fe0e515", features = ["unstable"] }
-tauri-runtime-cef = { git = "https://github.com/tauri-apps/tauri.git", rev = "fe0e515" }
+tauri-runtime-wry = { git = "https://github.com/tauri-apps/tauri.git", rev = "fe0e515" }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync"] }
 tokio-tungstenite = "0.28"
 uuid = { version = "1", features = ["v4"] }

@@ -5,11 +5,11 @@
 ```text
 Chromium DOM/profile (container tmpfs only)
   -> Xvnc framebuffer updates -> authenticated loopback WebSocket/RFB bridge
-  -> packaged CEF/noVNC canvas -> screen pixels
+  -> packaged WebKitGTK/noVNC canvas -> screen pixels
 keyboard + absolute pointer -> bridge -> Xvnc
 ```
 
-The CEF application loads only its packaged `index.html` and a pinned noVNC
+The WebKitGTK application loads only its packaged `index.html` and a pinned noVNC
 submodule. It is not a general browser for the remote session. It does not
 navigate to remote pages and it exposes no filesystem, shell, Docker, or
 arbitrary-network API to its JavaScript. The sole command returns the live
@@ -37,12 +37,13 @@ profile are tmpfs mounts. The host bind mount holds only the generated password
 file in the viewer-verified `XDG_RUNTIME_DIR` tmpfs directory and is read-only in
 the container.
 
-CEF uses a required Chromium sandbox and an off-the-record request context. Its
-otherwise-required CEF root cache path is also under the verified session tmpfs;
-CEF file logging is disabled and fatal stderr must be launched outside persistent
-journald/coredump capture. The app disables storage-adjacent browser features,
-DevTools remote debugging, downloads/printing, media capture, and command-line
-Chromium switches supplied by the launcher.
+The native WebKitGTK shell loads only the local viewer UI and uses an
+off-the-record request context. Chromium inside the desktop container keeps its
+own renderer sandbox; Docker's default seccomp profile cannot be used because it
+blocks the namespace setup required by that sandbox. The container therefore
+uses `seccomp=unconfined`, while still running as an unprivileged user with all
+Linux capabilities dropped, a read-only root, and no host mounts or device
+access. Host journald/coredump capture remains a strict-preflight concern.
 
 Deletion at exit is prompt cleanup only—not the privacy control. Volatile mounts
 prevent the session data from being written in the first place.

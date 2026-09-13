@@ -12,12 +12,13 @@ are unsupported in strict mode.
 ./scripts/preflight --strict
 git submodule update --init --recursive
 ./scripts/build
-cd viewer/src-tauri && cargo tauri build
+cd viewer/src-tauri && cargo build --release
+cd .. && ./launch
 ```
 
-The Tauri CEF runtime is pinned to an upstream `feat/cef` commit; it is not a
-stable standard Tauri webview path. The CEF bundle download is large and must be
-reviewed/pinned before distribution.
+The viewer uses Tauri's WebKitGTK runtime. Distribute it with the matching
+WebKitGTK system runtime (or a packaged runtime closure); `viewer/launch` shows
+a native error dialog if an ELF dependency is missing before the app can start.
 
 Run the packaged viewer, not a system browser and not `docker compose up`.
 The viewer creates a unique session and removes it when the window closes.
@@ -30,10 +31,12 @@ For a release candidate, collect sanitized evidence that:
   restart policy, no GPU/device/Docker socket/host-home mounts, and no published
   VNC port.
 - all container profile, downloads, temporary, runtime, Xvnc, and shared-memory
-  writes resolve to tmpfs; the viewer CEF root cache resolves to the same verified
-  host tmpfs.
-- the CEF renderer sandbox is active and software rendering is used; it has no
-  default profile, CEF log, keyring, or system-browser reuse.
+  writes resolve to tmpfs; the local WebKitGTK viewer uses an off-the-record
+  request context and never navigates to the remote browser.
+- Chromium's renderer sandbox starts successfully inside the desktop container.
+  This requires `seccomp=unconfined` because Docker's default seccomp profile
+  blocks Chromium's required namespace setup; verify the remaining container
+  hardening controls rather than adding `--no-sandbox`.
 - synthetic URLs, cookies, form values, IndexedDB/local-storage values, download
   names, and clipboard canaries do not appear in persistent paths or survive a
   fresh launch. Do not use real secrets for this test.
