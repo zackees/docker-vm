@@ -142,3 +142,9 @@ required and is created and verified by the viewer.
 
 See [DESIGN.md](DESIGN.md) and [docs/SETUP.md](docs/SETUP.md) for host policy,
 verification, and limitations.
+# Building from source
+
+The canonical build is `nix build .#docker-vm`. It uses the pinned Soldr
+release as Cargo's compiler front door, with its compile cache enabled, and a
+Nix-vendored copy of every Cargo dependency. `nix develop` provides the same
+Soldr, Rust, GTK, WebKit, and GStreamer environment for iterative builds.
