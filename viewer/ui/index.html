@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src ws://127.0.0.1:*; img-src 'self' data:; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'none'">
+    <title>Private desktop canvas</title>
+    <link rel="stylesheet" href="style.css">
+  </head>
+  <body>
+    <main id="screen" aria-label="Private remote desktop canvas"></main>
+    <p id="status" role="status">Starting an ephemeral desktop session…</p>
+    <script type="module" src="main.js"></script>
+  </body>
+</html>

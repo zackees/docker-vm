@@ -1,0 +1,9 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Docker VM Private Canvas",
+  "version": "0.1.0",
+  "identifier": "com.zackees.docker-vm.private-canvas",
+  "build": { "frontendDist": "../ui" },
+  "app": { "windows": [] },
+  "bundle": { "active": false, "icon": [] }
+}

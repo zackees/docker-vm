@@ -1,9 +1,4 @@
 #!/usr/bin/env bash
-# Launch Moonlight for a desktop session without fullscreen or system-key grabs.
 set -euo pipefail
-host="${1:?usage: scripts/connect HOST [APP]}"
-app="${2:-Desktop}"
-moonlight_bin="${MOONLIGHT_BIN:-moonlight}"
-SDL_MOUSE_AUTO_CAPTURE=0 exec "$moonlight_bin" stream --1080 --fps 60 --bitrate 20000 \
-  --video-codec H.264 --video-decoder hardware --display-mode windowed \
-  --absolute-mouse --capture-system-keys never --no-quit-after "$host" "$app"
+echo "Moonlight is no longer used. Launch the packaged Docker VM Private Canvas viewer." >&2
+exit 2

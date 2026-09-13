@@ -1,0 +1,3 @@
+[submodule "viewer/ui/novnc"]
+	path = viewer/ui/novnc
+	url = https://github.com/novnc/noVNC.git

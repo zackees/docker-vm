@@ -1,39 +1,43 @@
 name: docker-vm
 
+# No desktop/VNC port is published. The native viewer discovers the ephemeral
+# container address and owns the loopback-only authenticated RFB bridge.
 services:
-  wolf:
-    # Local wrapper: upstream Wolf pinned by images/wolf/Dockerfile, plus the
-    # exact NVRTC runtime needed by the tested NVENC pipeline.
-    image: docker-vm-wolf:local
-    container_name: docker-vm-wolf
-    network_mode: host
-    restart: unless-stopped
-    stop_grace_period: 45s
+  desktop:
+    build:
+      context: .
+      dockerfile: images/desktop/Dockerfile
+    image: docker-vm-desktop:local
+    user: "${SESSION_UID:?the private viewer must set the session UID}:${SESSION_GID:?the private viewer must set the session GID}"
+    read_only: true
+    init: true
+    restart: "no"
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    shm_size: 512m
     environment:
-      # The GoW entrypoint converts this into /etc/wolf/cfg/config.toml;
-      # Wolf resolves this mounted container path back to host state.
-      HOST_APPS_STATE_FOLDER: /etc/wolf
-      WOLF_DEFAULT_RUN_UID: ${WOLF_RUN_UID:?run scripts/configure first}
-      WOLF_DEFAULT_RUN_GID: ${WOLF_RUN_GID:?run scripts/configure first}
-      WOLF_RENDER_NODE: ${WOLF_RENDER_NODE:?run scripts/configure first}
-      WOLF_STOP_CONTAINER_ON_EXIT: "FALSE"
-      XDG_RUNTIME_DIR: /tmp/sockets
-      # Prefer the image's native EGL external-platform manifests over CDI's
-      # host-Nix paths, which are not meaningful in this Debian image.
-      __EGL_EXTERNAL_PLATFORM_CONFIG_DIRS: /usr/share/egl/egl_external_platform.d
-      GBM_BACKEND: nvidia-drm
-      GBM_BACKENDS_PATH: /usr/local/nvidia/lib/gbm
+      HOME: /home/desktop
+      XDG_RUNTIME_DIR: /run/user/1000
+      XDG_CACHE_HOME: /home/desktop/.cache
+      XDG_CONFIG_HOME: /home/desktop/.config
+      XDG_DATA_HOME: /home/desktop/.local/share
+      CHROMIUM_USER_DATA_DIR: /home/desktop/.config/chromium
+      VNC_PASSWORD_FILE: /run/session/vnc-password
+      LIBGL_ALWAYS_SOFTWARE: "1"
     volumes:
-      - ${WOLF_STATE_DIR:?run scripts/configure first}:/etc/wolf:rw
-      - ${WOLF_RUNTIME_DIR:?run scripts/configure first}:/tmp/sockets:rw
-      # Wolf is the trusted lifecycle controller. Workers never receive this socket.
-      - /var/run/docker.sock:/var/run/docker.sock:rw
-      # Required by Wolf for dynamically-created virtual input devices.
-      - /dev:/dev:rw
-      - /run/udev:/run/udev:rw
-    devices:
-      - /dev/dri:/dev/dri
-      - /dev/uinput:/dev/uinput
-      - /dev/uhid:/dev/uhid
-    device_cgroup_rules:
-      - "c 13:* rmw"
+      - type: bind
+        source: ${SESSION_RUNTIME_DIR:?the private viewer must create a verified tmpfs session directory}
+        target: /run/session
+        read_only: true
+        bind:
+          create_host_path: false
+    tmpfs:
+      - /home/desktop:uid=${SESSION_UID:?},gid=${SESSION_GID:?},mode=700,size=1024m
+      - /run/user/1000:uid=${SESSION_UID:?},gid=${SESSION_GID:?},mode=700,size=64m
+      - /tmp:mode=1777,size=256m
+      - /var/tmp:mode=1777,size=64m
+      - /var/cache:mode=755,size=64m
+    logging:
+      driver: none

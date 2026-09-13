@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${VNC_PASSWORD_FILE:?VNC_PASSWORD_FILE is required}"
+[[ -r "$VNC_PASSWORD_FILE" ]] || { echo "private VNC password file is unavailable" >&2; exit 1; }
+
+# Every writable directory below is a Docker tmpfs mount. Do not weaken this
+# with a fallback to the image filesystem or a host bind mount.
+for directory in "$HOME" "$XDG_RUNTIME_DIR" /tmp /var/tmp; do
+  [[ -d "$directory" && -w "$directory" ]] || { echo "volatile directory unavailable: $directory" >&2; exit 1; }
+done
+mkdir -p "$HOME/.config/chromium" "$HOME/Downloads" "$HOME/.vnc"
+chmod 0700 "$HOME" "$HOME/.config" "$HOME/.config/chromium" "$HOME/.vnc"
+
+password_file="$XDG_RUNTIME_DIR/vnc-password"
+umask 077
+vncpasswd -f <"$VNC_PASSWORD_FILE" >"$password_file"
+
+# Cut text is disabled in both directions. TigerVNC provides no file-transfer
+# extension here; the bridge only forwards RFB bytes.
+# Docker publishes no port. Do not add -localhost here: the host-owned bridge
+# connects to the container's private bridge-network address.
+Xtigervnc :0 -geometry "${DESKTOP_GEOMETRY:-1280x800}" -depth 24 \
+  -rfbport 5900 -SecurityTypes VncAuth -PasswordFile "$password_file" \
+  -AcceptCutText=0 -SendCutText=0 >"$XDG_RUNTIME_DIR/xvnc.log" 2>&1 &
+vnc_pid=$!
+trap 'kill "$vnc_pid" 2>/dev/null || true; wait "$vnc_pid" 2>/dev/null || true' EXIT INT TERM
+
+for _ in $(seq 1 50); do
+  [[ -S /tmp/.X11-unix/X0 ]] && break
+  sleep 0.1
+done
+[[ -S /tmp/.X11-unix/X0 ]] || { echo "Xvnc did not start" >&2; exit 1; }
+
+export DISPLAY=:0
+dbus-run-session -- sh -c '
+  startxfce4 &
+  exec chromium \
+    --user-data-dir="$CHROMIUM_USER_DATA_DIR" \
+    --no-first-run --no-default-browser-check --disable-gpu \
+    about:blank
+'
