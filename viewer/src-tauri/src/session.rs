@@ -47,7 +47,7 @@ impl SessionManager {
     write_secret(&root.join("vnc-password"), password.as_bytes())?;
     let result = (|| {
       compose(&project, &root, "up", &["-d", "--build"])?;
-      let vnc = container_vnc_address(&project)?;
+      let vnc = container_vnc_address(&project, &root)?;
       wait_for_vnc(vnc)?;
       let capability = secret(32)?;
       let (address, shutdown) = bridge(vnc, capability.clone())?;
@@ -132,10 +132,18 @@ fn compose(project: &str, runtime: &Path, action: &str, args: &[&str]) -> Result
   status.success().then_some(()).ok_or_else(|| format!("docker compose {action} failed"))
 }
 
-fn container_vnc_address(project: &str) -> Result<SocketAddr, String> {
+fn container_vnc_address(project: &str, runtime: &Path) -> Result<SocketAddr, String> {
   let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
   for _ in 0..30 {
-    let output = Command::new("docker").current_dir(&root).args(["compose", "-p", project, "-f", "compose.yaml", "ps", "-q", "desktop"]).output().map_err(|error| error.to_string())?;
+    let metadata = runtime.metadata().map_err(|error| error.to_string())?;
+    let output = Command::new("docker")
+      .current_dir(&root)
+      .env("SESSION_RUNTIME_DIR", runtime)
+      .env("SESSION_UID", metadata.uid().to_string())
+      .env("SESSION_GID", metadata.gid().to_string())
+      .args(["compose", "-p", project, "-f", "compose.yaml", "ps", "-q", "desktop"])
+      .output()
+      .map_err(|error| error.to_string())?;
     let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if !id.is_empty() {
       let output = Command::new("docker").args(["inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", &id]).output().map_err(|error| error.to_string())?;

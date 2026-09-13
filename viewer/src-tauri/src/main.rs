@@ -70,6 +70,8 @@ fn cef_runtime(manager: &SessionManager) -> Cef {
     .global_preference("devtools.remote_debugging.allowed", false)
     .command_line_args([
       ("disable-gpu", None),
+      ("use-gl", Some("swiftshader")),
+      ("use-angle", Some("swiftshader")),
       ("disable-breakpad", None),
       ("disable-features", Some("AutofillServerCommunication,MediaRouter")),
       ("no-first-run", None),
