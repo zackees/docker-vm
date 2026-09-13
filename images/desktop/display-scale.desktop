@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Desktop DPI
+Comment=Change desktop scaling or follow the host display
+Exec=/usr/local/bin/display-scale
+Icon=preferences-desktop-display
+Terminal=false
+Categories=Settings;DesktopSettings;
+StartupNotify=false

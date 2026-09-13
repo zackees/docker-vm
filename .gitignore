@@ -3,3 +3,5 @@ state/
 runtime/
 *.pem
 config/wolf/config.toml
+viewer/src-tauri/target/
+viewer/src-tauri/gen/
