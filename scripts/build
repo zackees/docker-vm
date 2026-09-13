@@ -7,8 +7,7 @@ if [[ $# -ne 0 && ${1:-} != "--help" ]]; then
   exit 2
 fi
 if [[ ${1:-} == "--help" ]]; then
-  echo "Build the pinned Wolf controller and Chromium desktop images required by compose."
+  echo "Build the CPU-only ephemeral Chromium desktop image required by compose."
   exit 0
 fi
-docker build --pull -t docker-vm-wolf:local "$root/images/wolf"
-docker build --pull -t docker-vm-desktop:local "$root/images/desktop"
+docker build --pull -t docker-vm-desktop:local -f "$root/images/desktop/Dockerfile" "$root"

@@ -1,39 +1,31 @@
 #!/usr/bin/env bash
-# Read-only host readiness report. It deliberately does not start a container.
+# Read-only diskless-session eligibility report.
 set -u -o pipefail
-fail=0
-pass() { printf 'PASS  %s\n' "$*"; }
-warn() { printf 'WARN  %s\n' "$*"; }
-bad() { printf 'FAIL  %s\n' "$*"; fail=1; }
-need() { command -v "$1" >/dev/null 2>&1 && pass "found $1" || bad "missing $1"; }
-printf 'docker-vm preflight (read-only)\n'
-printf 'host: %s %s (%s)\n' "$(uname -s)" "$(uname -r)" "$(uname -m)"
-render_node="${WOLF_RENDER_NODE:-${GPU_RENDER_NODE:-/dev/dri/renderD128}}"
-printf 'selected render node: %s (set WOLF_RENDER_NODE explicitly on multi-GPU hosts)\n' "$render_node"
-need docker
-if docker compose version >/dev/null 2>&1; then pass "found Docker Compose plugin"; else bad "Docker Compose v2 is unavailable"; fi
-if docker info >/dev/null 2>&1; then pass "Docker daemon reachable (context $(docker context show 2>/dev/null || printf unknown))"; else bad "Docker daemon is not reachable by this user"; fi
-if command -v nvidia-smi >/dev/null 2>&1; then
-  if gpus="$(nvidia-smi --query-gpu=index,name,uuid,pci.bus_id,driver_version --format=csv,noheader 2>/dev/null)" && [[ -n "$gpus" ]]; then
-    while IFS= read -r gpu; do pass "NVIDIA GPU: $gpu"; done <<< "$gpus"
-  else
-    bad "nvidia-smi exists but cannot query a GPU"
-  fi
-  if docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q nvidia; then pass "NVIDIA Docker runtime registered"; else warn "NVIDIA runtime is not listed. Docker 29 may use CDI, but GPU containers must be proven before streaming."; fi
-  if find /var/run/cdi /etc/cdi -maxdepth 1 -type f -iname '*nvidia*' -print -quit 2>/dev/null | grep -q .; then pass "NVIDIA CDI specification present"; else warn "no NVIDIA CDI spec found; record a successful controller/worker GPU test before treating GPU access as ready"; fi
-else
-  warn "nvidia-smi not found; Intel/AMD users must verify render-node identity and encoder support in the selected image"
-fi
-for node in /sys/class/drm/renderD*/device; do
-  [[ -e "$node" ]] || continue
-  name="${node%/device}"; name="${name##*/}"
-  vendor="$(cat "$node/vendor" 2>/dev/null || printf unknown)"
-  pci="$(readlink -f "$node" 2>/dev/null | sed 's|.*/\(0000:[^/]*\).*|\1|')"
-  driver="$(basename "$(readlink -f "$node/driver" 2>/dev/null || printf unknown)")"
-  pass "DRM $name: vendor=$vendor pci=$pci driver=$driver"
-done
-if [[ -r "$render_node" ]]; then pass "current user can read selected node $render_node"; else warn "current user cannot read selected node $render_node (or it is absent)"; fi
-if command -v moonlight >/dev/null 2>&1; then pass "native Moonlight client available: $(moonlight --version 2>&1 | head -1)"; else warn "Moonlight client not found; client decode and remote presentation remain unverified"; fi
+strict=0; [[ ${1:-} == --strict ]] && strict=1
+[[ $# -le 1 ]] || { echo "usage: $0 [--strict]" >&2; exit 2; }
+bad=0
+pass(){ printf 'PASS  %s\n' "$*"; }; warn(){ printf 'WARN  %s\n' "$*"; }; fail(){ printf 'FAIL  %s\n' "$*"; bad=1; }
+mount_type() { findmnt -no FSTYPE -T "$1" 2>/dev/null || true; }
+printf 'docker-vm strict preflight (read-only)\n'
+[[ $(uname -s) == Linux ]] && pass 'native Linux host' || fail 'only native Linux is supported'
+command -v docker >/dev/null && pass 'Docker client found' || fail 'Docker client missing'
+if docker info >/dev/null 2>&1; then
+  context=$(docker context show 2>/dev/null || true)
+  [[ $context == default ]] && pass 'Docker daemon reachable on default context' || fail "Docker context '$context' is unsupported in strict mode"
+  docker info --format '{{.OperatingSystem}}' 2>/dev/null | grep -qi 'docker desktop' && fail 'Docker Desktop/VM backing storage is unsupported' || pass 'not Docker Desktop'
+else fail 'Docker daemon unreachable'; fi
+runtime=${XDG_RUNTIME_DIR:-}
+if [[ -n $runtime && -d $runtime ]]; then
+  fs=$(mount_type "$runtime"); [[ $fs == tmpfs ]] && pass "XDG_RUNTIME_DIR is tmpfs: $runtime" || fail "XDG_RUNTIME_DIR is '$fs', not tmpfs: $runtime"
+else fail 'XDG_RUNTIME_DIR is unavailable'; fi
+if [[ -r /proc/swaps ]]; then
+  swaps=$(awk 'NR>1 && $1 !~ /^\/dev\/zram/ {print $1}' /proc/swaps); [[ -z $swaps ]] && pass 'no non-zram active swap' || fail "active disk-backed swap: $swaps"
+  zram=$(awk 'NR>1 && $1 ~ /^\/dev\/zram/ {print $1}' /proc/swaps); [[ -z $zram ]] && pass 'no zram swap' || warn "zram requires an administrator-confirmed no-writeback policy: $zram"
+else fail 'cannot inspect /proc/swaps'; fi
+if [[ -r /sys/power/state ]] && grep -qw disk /sys/power/state; then fail 'hibernation is available; disable it under the supported host policy'; else pass 'hibernation state is unavailable'; fi
+core_pattern=$(cat /proc/sys/kernel/core_pattern 2>/dev/null || true)
+[[ $core_pattern == '|'* || $core_pattern == /dev/null ]] && pass 'kernel core routing is not a direct disk file' || fail "kernel core pattern may write files: ${core_pattern:-unknown}"
+if command -v systemctl >/dev/null 2>&1; then systemctl is-active --quiet systemd-coredump.socket && fail 'systemd-coredump is active' || pass 'systemd-coredump socket is inactive or unavailable'; fi
 printf '\nResult: '
-if ((fail)); then printf 'NOT READY (hard prerequisites missing)\n'; exit 1; fi
-printf 'HOST INSPECTED. Warnings are evidence gaps, not accelerated passes.\n'
+if ((bad)); then ((strict)) && printf 'REFUSED: strict diskless requirements are not met.\n' || printf 'INCOMPLETE: fix FAIL items before claiming disklessness.\n'; exit 1; fi
+printf 'HOST ELIGIBLE: re-check before every privacy-sensitive session.\n'
