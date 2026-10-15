@@ -32,6 +32,20 @@
         };
       };
 
+      # noVNC is a git submodule (viewer/ui/novnc), and a flake's own source
+      # never includes submodule contents: `src = ./.`, a github: input and
+      # the default git+ input all deliver the directory empty. The viewer
+      # still built, and then hung on "Starting..." forever, because main.js
+      # imports novnc/core/rfb.js as an ES module and a failed module import
+      # stops the script before any of it runs. Pin the same commit here and
+      # keep it in step with the submodule when bumping either.
+      noVNC = pkgs.fetchFromGitHub {
+        owner = "novnc";
+        repo = "noVNC";
+        rev = "a8dfd6a3ea3c74244f5ebdaa5a7f1023007a7820"; # v1.6.0
+        hash = "sha256-VYG0p70ZvRzK9IeA+5J95FqF+zWgj/8EcxnVOk+YL9o=";
+      };
+
       dockerVm = pkgs.stdenv.mkDerivation {
         pname = "docker-vm";
         version = "0.1.0";
@@ -55,6 +69,18 @@
           categories = [ "Network" "RemoteAccess" ];
           startupWMClass = "docker-vm-viewer";
         }) ];
+        postPatch = ''
+          if [ ! -e viewer/ui/novnc/core/rfb.js ]; then
+            rm -rf viewer/ui/novnc
+            cp -r ${noVNC} viewer/ui/novnc
+            chmod -R u+w viewer/ui/novnc
+          fi
+          # Fail here rather than ship a viewer whose page cannot start.
+          test -e viewer/ui/novnc/core/rfb.js || {
+            echo "viewer/ui/novnc/core/rfb.js missing: noVNC not vendored" >&2
+            exit 1
+          }
+        '';
         buildPhase = ''
           runHook preBuild
           export DOCKER_VM_SOURCE_ROOT="$PWD"

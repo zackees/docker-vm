@@ -25,6 +25,9 @@ pub struct Connection {
   pub websocket_url: String,
   pub capability: String,
   pub vnc_password: String,
+  /// Container VNC endpoint (ip:5900) the bridge relays to. Shown in the
+  /// viewer's status text so a hang names where it is stuck; not a secret.
+  pub vnc_target: String,
 }
 
 pub struct SessionManager {
@@ -51,7 +54,7 @@ impl SessionManager {
       wait_for_vnc(vnc)?;
       let capability = secret(32)?;
       let (address, shutdown) = bridge(vnc, capability.clone())?;
-      let connection = Connection { websocket_url: format!("ws://{address}"), capability, vnc_password: password };
+      let connection = Connection { websocket_url: format!("ws://{address}"), capability, vnc_password: password, vnc_target: vnc.to_string() };
       Ok((connection, shutdown))
     })();
     match result {
