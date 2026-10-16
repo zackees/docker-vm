@@ -41,6 +41,9 @@ For a release candidate, collect sanitized evidence that:
   device present (`chrome://gpu` in the session reports hardware acceleration
   on ANGLE/Vulkan), and `DOCKER_VM_GPU=off` or an unusable `/dev/kvm` falls
   back to CPU rendering.
+- on a GPU host, `tests/gpu-render.sh` passes: the Xvnc framebuffer shows the
+  page and its WebGL canvas, drawn by the NVIDIA renderer (not just
+  `chrome://gpu` claiming acceleration).
 - with a synthetic encrypted archive mounted, the target is read-only in the
   container, reads as UID 0 or any other UID fail with `Permission denied`, the
   host mount options show no `allow_other`, and the mount and its directory are
