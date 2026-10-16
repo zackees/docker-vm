@@ -15,6 +15,7 @@ RUN apt-get update \
       chromium chromium-sandbox dbus-x11 dumb-init tigervnc-standalone-server \
       tigervnc-tools xauth xfce4 xfce4-terminal python3-gi gir1.2-gtk-3.0 x11-xserver-utils \
       gdb x11-utils \
+      libegl1 libgles2 libgl1 libvulkan1 \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --create-home --uid 1000 --shell /bin/bash desktop \
  && install -d -o desktop -g desktop -m 0700 /home/desktop
@@ -25,6 +26,11 @@ COPY --chmod=0755 images/desktop/crash-watch /usr/local/bin/crash-watch
 COPY images/desktop/browser-backtrace.gdb /usr/local/share/browser-backtrace.gdb
 COPY --chmod=0755 images/desktop/display-scale /usr/local/bin/display-scale
 COPY images/desktop/display-scale.desktop /usr/share/applications/display-scale.desktop
+# GPU mode only: the NVIDIA CDI spec injects the driver libraries and device
+# nodes but not these loader registrations, so glvnd/Vulkan would never pick
+# the driver. In CPU mode no library they name exists and nothing loads them.
+COPY images/desktop/nvidia-egl-vendor.json /usr/share/glvnd/egl_vendor.d/10_nvidia.json
+COPY images/desktop/nvidia-vulkan-icd.json /usr/share/vulkan/icd.d/nvidia_icd.json
 
 USER desktop
 EXPOSE 5900

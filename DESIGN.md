@@ -35,12 +35,29 @@ is terminal: the viewer never resumes or reconnects to a stale desktop.
 ## Persistence controls
 
 The desktop container has a read-only root, no Docker socket, no host display,
-no host home, no GPU device, no restart policy, no published ports, and Docker
-logging disabled. Its writable home/profile/downloads/cache, runtime directory,
+no host home, no restart policy, no published ports, and Docker logging
+disabled. It has no GPU device unless GPU rendering applies (below). Its writable home/profile/downloads/cache, runtime directory,
 temporary directories, shared memory, Xvnc logs, VNC password hash, and Chromium
 profile are tmpfs mounts. The host bind mount holds only the generated password
 file in the viewer-verified `XDG_RUNTIME_DIR` tmpfs directory and is read-only in
 the container.
+
+## GPU rendering
+
+GPU rendering is automatic. At launch, off the UI thread, the viewer checks that
+`/dev/kvm` is openable read-write (KVM is enabled only selectively on some hosts)
+and that `docker info` lists an NVIDIA CDI device (`nvidia.com/gpu=N`). If both
+hold, a per-session compose override attaches the lowest-numbered GPU (never
+`=all`) and sets `DESKTOP_GPU=nvidia`; Chromium then renders through ANGLE on
+the driver's Vulkan device and frames are read back into the Xvnc framebuffer.
+The RFB transport is unchanged. If any check fails, or the container cannot
+start with the device, the session uses the CPU path: software rendering with
+Chromium's GPU process disabled, exactly as before. `DOCKER_VM_GPU=off` forces
+the CPU path.
+
+This deliberately widens the attack surface: remote Chromium content reaches
+the host's NVIDIA kernel driver through the GPU process. The device nodes and
+driver libraries come from the host's CDI spec; nothing else is added.
 
 Archive mounts are opt-in (`--mount type=zip`) and are the only other host binds.
 Each binds an empty directory beside the session directory read-only with

@@ -34,11 +34,21 @@ done
 
 export DISPLAY=:0
 display-scale --prepare
+# The viewer sets DESKTOP_GPU=nvidia only after Docker attached an NVIDIA CDI
+# device. Xvnc has no GPU, so Chromium renders through ANGLE on the driver's
+# Vulkan device and reads frames back into the VNC framebuffer. Without it,
+# the CPU path is unchanged: software rendering with the GPU process off.
+if [[ ${DESKTOP_GPU:-} == nvidia ]]; then
+  unset LIBGL_ALWAYS_SOFTWARE
+  export CHROMIUM_GPU_FLAGS="--ignore-gpu-blocklist --use-angle=vulkan --enable-features=Vulkan,DefaultANGLEVulkan,VulkanFromANGLE"
+else
+  export CHROMIUM_GPU_FLAGS="--disable-gpu"
+fi
 dbus-run-session -- sh -c '
   startxfce4 &
   display-scale &
   exec crash-watch /usr/lib/chromium/chromium \
     --user-data-dir="$CHROMIUM_USER_DATA_DIR" \
-    --no-first-run --no-default-browser-check --disable-gpu \
+    --no-first-run --no-default-browser-check $CHROMIUM_GPU_FLAGS \
     about:blank
 '
