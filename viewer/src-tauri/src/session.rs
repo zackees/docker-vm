@@ -5,7 +5,7 @@ use std::{
   os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
   path::{Path, PathBuf},
   process::{Child, Command, Stdio},
-  sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}},
+  sync::{Arc, Mutex, atomic::{AtomicBool, AtomicU64, Ordering}},
   thread,
   time::Duration,
 };
@@ -53,6 +53,8 @@ pub struct SessionManager {
   progress: Arc<Progress>,
   startup: Mutex<Option<thread::JoinHandle<()>>>,
   shutdown: Mutex<Option<watch::Sender<bool>>>,
+  // RFB bytes forwarded to the viewer; read only by `DOCKER_VM_STATS` reports.
+  bridged_bytes: Arc<AtomicU64>,
 }
 
 /// What the window shows while the session starts. Polled by the UI, so the
@@ -147,6 +149,7 @@ impl SessionManager {
     let manager = Arc::new(Self {
       root, project, overrides: Mutex::new(overrides), mounts_dir, mount_points,
       archive_mounts: Mutex::new(Vec::new()), progress, startup: Mutex::new(None), shutdown: Mutex::new(None),
+      bridged_bytes: Arc::new(AtomicU64::new(0)),
     });
     let password = secret(24)?;
     write_secret(&manager.root.join("vnc-password"), password.as_bytes())?;
@@ -199,7 +202,7 @@ impl SessionManager {
     let vnc = container_vnc_address(&self.project, &self.root, &self.overrides())?;
     wait_for_vnc(vnc, progress)?;
     let capability = secret(32)?;
-    let (address, shutdown) = bridge(vnc, capability.clone())?;
+    let (address, shutdown) = bridge(vnc, capability.clone(), Arc::clone(&self.bridged_bytes))?;
     *self.shutdown.lock().map_err(|_| "shutdown lock unavailable")? = Some(shutdown);
     Ok(Connection { websocket_url: format!("ws://{address}"), capability, vnc_password: password })
   }
@@ -235,6 +238,9 @@ impl SessionManager {
       result => result,
     }
   }
+
+  /// Total RFB bytes sent to the viewer so far (`DOCKER_VM_STATS` only).
+  pub fn bridged_bytes(&self) -> u64 { self.bridged_bytes.load(Ordering::Relaxed) }
 
   pub fn status(&self) -> Status {
     self.progress.status.lock().map(|status| status.clone()).unwrap_or(Status::Failed { error: "status unavailable".into(), log: Vec::new() })
@@ -590,7 +596,7 @@ fn ensure_image(progress: &Arc<Progress>) -> Result<(), String> {
   progress.run(build, "desktop image build")
 }
 
-fn bridge(vnc: SocketAddr, capability: String) -> Result<(SocketAddr, watch::Sender<bool>), String> {
+fn bridge(vnc: SocketAddr, capability: String, bytes: Arc<AtomicU64>) -> Result<(SocketAddr, watch::Sender<bool>), String> {
   let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|error| format!("bind bridge: {error}"))?;
   let address = listener.local_addr().map_err(|error| error.to_string())?;
   listener.set_nonblocking(true).map_err(|error| error.to_string())?;
@@ -604,7 +610,7 @@ fn bridge(vnc: SocketAddr, capability: String) -> Result<(SocketAddr, watch::Sen
         tokio::select! {
           _ = stopped.changed() => break,
           accepted = listener.accept() => match accepted {
-            Ok((stream, _)) => { let capability = capability.clone(); let capability_used = Arc::clone(&capability_used); tokio::spawn(proxy(stream, vnc, capability, capability_used)); }
+            Ok((stream, _)) => { let capability = capability.clone(); let capability_used = Arc::clone(&capability_used); tokio::spawn(proxy(stream, vnc, capability, capability_used, Arc::clone(&bytes))); }
             Err(_) => break,
           }
         }
@@ -614,7 +620,7 @@ fn bridge(vnc: SocketAddr, capability: String) -> Result<(SocketAddr, watch::Sen
   Ok((address, shutdown))
 }
 
-async fn proxy(stream: TcpStream, vnc: SocketAddr, capability: String, capability_used: Arc<AtomicBool>) {
+async fn proxy(stream: TcpStream, vnc: SocketAddr, capability: String, capability_used: Arc<AtomicBool>, bytes: Arc<AtomicU64>) {
   let callback = move |request: &Request, mut response: Response| {
     let origin = request.headers().get("origin").and_then(|value| value.to_str().ok());
     let protocols = request.headers().get("sec-websocket-protocol").and_then(|value| value.to_str().ok()).unwrap_or("");
@@ -643,6 +649,7 @@ async fn proxy(stream: TcpStream, vnc: SocketAddr, capability: String, capabilit
     let mut buffer = vec![0; 16 * 1024];
     loop {
       let count = match tokio::io::AsyncReadExt::read(&mut vnc_read, &mut buffer).await { Ok(0) | Err(_) => break, Ok(count) => count };
+      bytes.fetch_add(count as u64, Ordering::Relaxed);
       if ws_write.send(Message::Binary(buffer[..count].to_vec().into())).await.is_err() { break; }
     }
   };

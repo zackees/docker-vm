@@ -26,6 +26,35 @@ async function ready() {
   }
 }
 
+// DOCKER_VM_STATS=1 only: count painted frames and time spent decoding RFB
+// updates. Wraps pinned noVNC v1.6.0 internals that are looked up per call.
+function countFrames(rfb) {
+  // `frames` counts content frames: benchmark pages stamp a frame counter as
+  // the colour of the framebuffer's top-left 32x32 block, so each distinct
+  // value seen after a paint is one new page frame, however it was split into
+  // RFB updates.
+  let frames = 0, decodeMs = 0, since = performance.now(), last = -1;
+  const display = rfb._display;
+  const flip = display.flip.bind(display);
+  display.flip = (...args) => {
+    const result = flip(...args);
+    const [r, g] = display._drawCtx.getImageData(16, 16, 1, 1).data;
+    const stamp = (r >> 5) | ((g >> 5) << 3);
+    if (stamp !== last) { frames++; last = stamp; }
+    return result;
+  };
+  const update = rfb._framebufferUpdate.bind(rfb);
+  rfb._framebufferUpdate = () => {
+    const start = performance.now();
+    try { return update(); } finally { decodeMs += performance.now() - start; }
+  };
+  setInterval(() => {
+    const now = performance.now();
+    window.__TAURI__.core.invoke('report_stats', { frames, decodeMs, seconds: (now - since) / 1000 });
+    frames = 0; decodeMs = 0; since = now;
+  }, 2000);
+}
+
 async function connection() {
   // Returns an in-memory, one-use bridge capability.
   // It does not expose Docker, filesystem, shell, or arbitrary network APIs.
@@ -60,6 +89,10 @@ try {
   // Viewport scaling remains a fallback while the server applies the change.
   rfb.resizeSession = true;
   rfb.viewOnly = false;
+  const tuning = await window.__TAURI__.core.invoke('rfb_tuning');
+  if (tuning.quality !== null) rfb.qualityLevel = tuning.quality;
+  if (tuning.compression !== null) rfb.compressionLevel = tuning.compression;
+  if (await window.__TAURI__.core.invoke('stats_enabled')) countFrames(rfb);
   rfb.addEventListener('connect', () => document.documentElement.classList.add('connected'));
   rfb.addEventListener('disconnect', event => {
     document.documentElement.classList.remove('connected');

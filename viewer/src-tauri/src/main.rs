@@ -44,7 +44,7 @@ fn main() {
   tauri::Builder::default()
     .runtime(tauri_runtime_wry::Wry::default())
     .manage(manager)
-    .invoke_handler(tauri::generate_handler![status, connection, set_display_scale])
+    .invoke_handler(tauri::generate_handler![status, connection, set_display_scale, stats_enabled, report_stats, rfb_tuning])
     .setup(|app| {
       WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
         .title("Private desktop canvas")
@@ -87,6 +87,37 @@ fn stop_on_signal(manager: Arc<SessionManager>) {
   for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
     unsafe { libc::signal(signal, handle as *const () as libc::sighandler_t) };
   }
+}
+
+/// Opt-in performance counters (`DOCKER_VM_STATS=1`): the UI counts painted
+/// frames and decode time; the bridge counts RFB bytes. Printed to stderr only.
+fn stats_on() -> bool { std::env::var_os("DOCKER_VM_STATS").is_some_and(|value| value == "1") }
+
+/// RFB encoding levels requested by the viewer. Each is 0-9; unset or invalid
+/// keeps the built-in default. `DOCKER_VM_RFB_QUALITY` is the Tight JPEG
+/// quality, `DOCKER_VM_RFB_COMPRESSION` the zlib level.
+#[derive(serde::Serialize)]
+struct RfbTuning { quality: Option<u8>, compression: Option<u8> }
+
+#[tauri::command]
+fn rfb_tuning() -> RfbTuning {
+  let level = |name: &str| std::env::var(name).ok()?.parse::<u8>().ok().filter(|level| *level <= 9);
+  RfbTuning { quality: level("DOCKER_VM_RFB_QUALITY"), compression: level("DOCKER_VM_RFB_COMPRESSION") }
+}
+
+#[tauri::command]
+fn stats_enabled() -> bool { stats_on() }
+
+#[tauri::command]
+fn report_stats(manager: tauri::State<'_, Arc<SessionManager>>, frames: u32, decode_ms: f64, seconds: f64) {
+  if !stats_on() || !(seconds.is_finite() && seconds > 0.0) { return; }
+  static LAST_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+  let total = manager.bridged_bytes();
+  let bytes = total.saturating_sub(LAST_BYTES.swap(total, std::sync::atomic::Ordering::Relaxed));
+  eprintln!(
+    "stats: {:.1} content fps, decode {:.0} ms/s, {:.1} Mbit/s RFB",
+    f64::from(frames) / seconds, decode_ms / seconds, bytes as f64 * 8.0 / 1e6 / seconds,
+  );
 }
 
 #[tauri::command]
