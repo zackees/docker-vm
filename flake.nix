@@ -10,15 +10,14 @@
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
-      # Soldr is the compiler front door.  Pinning the release archive makes
-      # the build engine itself part of this flake's reproducible closure.
-      soldr = pkgs.stdenvNoCC.mkDerivation {
+      # Soldr is the compiler front door.  The release archive is pinned in
+      # soldr.json (refreshed by scripts/update-soldr), so the build engine is
+      # part of this flake's reproducible closure.  Consumers that track the
+      # newest soldr pass their own pin through `mkSoldr` and `.override`.
+      mkSoldr = pin: pkgs.stdenvNoCC.mkDerivation {
         pname = "soldr";
-        version = "0.9.15";
-        src = pkgs.fetchurl {
-          url = "https://github.com/zackees/soldr/releases/download/v0.9.15/soldr-v0.9.15-x86_64-unknown-linux-gnu.tar.zst";
-          hash = "sha256-3E+z9q7W/Yy38Iboh6h0nRdIorb1JJQ1rhtBACXkfAM=";
-        };
+        inherit (pin) version;
+        src = pkgs.fetchurl { inherit (pin) url hash; };
         nativeBuildInputs = [ pkgs.zstd pkgs.autoPatchelfHook ];
         buildInputs = [ pkgs.stdenv.cc.cc.lib ];
         unpackPhase = "tar --use-compress-program=unzstd -xf $src";
@@ -27,6 +26,22 @@
           install -Dm755 soldr-daemon $out/bin/soldr-daemon
         '';
       };
+      soldr = mkSoldr (builtins.fromJSON (builtins.readFile ./soldr.json));
+
+      # Soldr resolves the repo-pinned toolchain through rustup, which cannot
+      # download inside the sandbox.  Present Nix's rustc as that rustup
+      # toolchain instead: same version, nothing fetched.
+      toolchainChannel = (builtins.fromTOML (builtins.readFile ./rust-toolchain.toml)).toolchain.channel;
+      rustupToolchain = assert pkgs.lib.assertMsg (toolchainChannel == pkgs.rustc.version)
+        "rust-toolchain.toml pins ${toolchainChannel}, but nixpkgs provides rustc ${pkgs.rustc.version}";
+        "${toolchainChannel}-x86_64-unknown-linux-gnu";
+      rustupShim = pkgs.writeShellScript "rustup" ''
+        case "$1 $2" in
+          "toolchain list") echo "${rustupToolchain} (default)" ;;
+          "toolchain install") ;;
+          *) echo "rustup (Nix shim): unsupported: $*" >&2; exit 1 ;;
+        esac
+      '';
 
       cargoVendor = pkgs.rustPlatform.importCargoLock {
         lockFile = ./viewer/src-tauri/Cargo.lock;
@@ -35,13 +50,16 @@
         };
       };
 
-      dockerVm = pkgs.stdenv.mkDerivation {
+      dockerVm = pkgs.lib.makeOverridable ({ soldr }: pkgs.stdenv.mkDerivation {
         pname = "docker-vm";
         version = "0.1.0";
         src = ./.;
         nativeBuildInputs = [
           pkgs.pkg-config pkgs.wrapGAppsHook3 pkgs.makeWrapper
-          pkgs.copyDesktopItems soldr
+          pkgs.copyDesktopItems soldr pkgs.clang pkgs.lld
+          # Soldr's linker driver bypasses Nix's ld-wrapper, which is what
+          # normally records library RUNPATHs; restore them from buildInputs.
+          pkgs.autoPatchelfHook
         ];
         buildInputs = [
           pkgs.gtk3 pkgs.webkitgtk_4_1 pkgs.glib pkgs.libsoup_3
@@ -75,14 +93,18 @@
           offline = true
           EOF
           export HOME="$TMPDIR/home"
-          export CARGO_HOME="$TMPDIR/rustup-home"
+          export CARGO_HOME="$TMPDIR/cargo-home"
+          export RUSTUP_HOME="$TMPDIR/rustup-home"
           export SOLDR_CACHE_DIR="$TMPDIR/soldr-cache"
-          # Nix supplies the host compiler and native libraries.  Disable
-          # Soldr's optional network catalogue so this derivation stays pure.
-          export SOLDR_MANIFEST_DISABLE=1
-          mkdir -p "$HOME" "$SOLDR_CACHE_DIR" "$CARGO_HOME/bin"
-          ln -s ${pkgs.cargo}/bin/cargo "$CARGO_HOME/bin/cargo"
-          ln -s ${pkgs.rustc}/bin/rustc "$CARGO_HOME/bin/rustc"
+          # Nix supplies the toolchain, linker and native libraries.  Disable
+          # Soldr's network catalogue and rustup bootstrap so this stays pure.
+          export SOLDR_MANIFEST_DISABLE=1 SOLDR_NO_BOOTSTRAP=1
+          toolchain="$RUSTUP_HOME/toolchains/${rustupToolchain}"
+          mkdir -p "$HOME" "$SOLDR_CACHE_DIR" "$CARGO_HOME/bin" "$toolchain/bin" "$TMPDIR/shim"
+          ln -s ${pkgs.rustc.unwrapped}/lib "$toolchain/lib"
+          ln -s ${pkgs.rustc.unwrapped}/bin/* ${pkgs.cargo}/bin/* "$toolchain/bin/"
+          ln -s ${rustupShim} "$TMPDIR/shim/rustup"
+          export PATH="$TMPDIR/shim:$PATH"
           cd viewer/src-tauri
           # Use Soldr's Cargo front door: its compiler cache is active while
           # Nix supplies the native GTK/WebKit libraries for this host build.
@@ -117,13 +139,16 @@
           platforms = [ system ];
           mainProgram = "docker-vm";
         };
-      };
+      }) { inherit soldr; };
     in {
       packages.${system} = {
         default = dockerVm;
         docker-vm = dockerVm;
         inherit soldr;
       };
+      # `mkSoldr pin` builds any soldr release from a soldr.json-shaped pin;
+      # `docker-vm.override { soldr = ...; }` builds the viewer with it.
+      lib.mkSoldr = mkSoldr;
       devShells.${system}.default = pkgs.mkShell {
         packages = [ pkgs.cargo pkgs.rustc soldr pkgs.pkg-config ];
         buildInputs = dockerVm.buildInputs;

@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Pin soldr.json to soldr's latest GitHub release. The release API is the
+# manifest: it names the x86_64 Linux archive and publishes its sha256.
+# Usage: scripts/update-soldr [path/to/soldr.json]   (default: repo soldr.json)
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+pin=${1:-"$root/soldr.json"}
+asset_suffix=x86_64-unknown-linux-gnu.tar.zst
+
+release=$(curl -fsSL -H 'Accept: application/vnd.github+json' \
+  https://api.github.com/repos/zackees/soldr/releases/latest)
+read -r version url digest < <(python3 -c '
+import json, sys
+release = json.load(sys.stdin)
+suffix = sys.argv[1]
+[asset] = [a for a in release["assets"]
+           if a["name"].endswith(suffix) and "-symbols" not in a["name"]]
+algorithm, _, value = (asset.get("digest") or "").partition(":")
+if algorithm != "sha256" or not value:
+    sys.exit(asset["name"] + ": release asset has no sha256 digest")
+print(release["tag_name"].removeprefix("v"), asset["browser_download_url"], value)
+' "$asset_suffix" <<<"$release")
+
+hash=$(nix hash convert --hash-algo sha256 --to sri "$digest")
+printf '{\n  "version": "%s",\n  "url": "%s",\n  "hash": "%s"\n}\n' "$version" "$url" "$hash" > "$pin.next"
+mv "$pin.next" "$pin"
+echo "soldr $version -> $pin"
