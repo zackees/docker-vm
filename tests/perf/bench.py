@@ -231,6 +231,8 @@ def measure(variant: Variant, viewer_bin: Path, scale: str, seconds: float, logs
         result.container_cpu = cpu_shares(before_in, sample(inside), elapsed)
         result.viewer_cpu = cpu_shares(before_out, sample(outside), elapsed)
         result.stats = stats_after(log, offset)
+        service_log = docker_exec(container, "cat", "/run/user/1000/video-stream.log")
+        (logs / f"video-stream-{variant.label}.log").write_text(service_log)
         fps = re.search(r"fps [\d.]+", docker_exec(container, "xwininfo", "-root", "-tree"))
         result.page_fps = fps.group(0).removeprefix("fps ") if fps else "?"
     except (RuntimeError, TimeoutError) as error:
@@ -272,6 +274,7 @@ def main() -> int:
     parser.add_argument("--logs", type=Path, default=None)
     args = parser.parse_args()
     logs = args.logs or Path(tempfile.mkdtemp(prefix="docker-vm-bench."))
+    logs.mkdir(parents=True, exist_ok=True)
     print(f"logs: {logs}")
     for spec in args.specs:
         report(measure(Variant.parse(spec), args.viewer_bin, args.scale, args.seconds, logs))

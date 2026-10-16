@@ -45,12 +45,6 @@ class Config:
         return cls(cuda_device=int(os.environ.get("DESKTOP_VIDEO_CUDA_DEVICE", "0")))
 
 
-@dataclass(frozen=True)
-class Size:
-    width: int
-    height: int
-
-
 def log(message: str) -> None:
     print(f"video-stream: {message}", file=sys.stderr, flush=True)
 
@@ -81,14 +75,14 @@ def self_test(config: Config) -> bool:
 class Stream:
     """One capture/encode pipeline feeding one connected client."""
 
-    def __init__(self, config: Config, client: socket.socket, size: Size) -> None:
+    def __init__(self, config: Config, client: socket.socket) -> None:
         self.client = client
         self.failed = threading.Event()
         # A leaky queue drops raw frames, never encoded ones, when the client
         # or encoder falls behind, so every sent P-frame still decodes.
         self.pipeline = Gst.parse_launch(
             f"ximagesrc display-name=:0 use-damage=false show-pointer=false ! "
-            f"video/x-raw,framerate={config.fps}/1,width={size.width},height={size.height} ! "
+            f"video/x-raw,framerate={config.fps}/1 ! "
             f"queue leaky=downstream max-size-buffers=1 max-size-time=0 max-size-bytes=0 ! "
             f"cudaupload ! {encoder(config)} ! h264parse config-interval=-1 ! "
             f"video/x-h264,stream-format=byte-stream,alignment=au ! "
@@ -131,18 +125,29 @@ class Server:
         self.screen = Gdk.Screen.get_default()
         self.client: socket.socket | None = None
         self.stream: Stream | None = None
+        self.pending_restart = 0
 
-    def size(self) -> Size:
-        root = self.screen.get_root_window()
-        return Size(root.get_width(), root.get_height())
-
-    def restart(self) -> None:
+    def restart(self) -> bool:
+        self.pending_restart = 0
         if self.stream:
             self.stream.stop()
             self.stream = None
         if self.client:
-            self.stream = Stream(self.config, self.client, self.size())
+            try:
+                # ximagesrc negotiates the current root size itself.
+                self.stream = Stream(self.config, self.client)
+            except GLib.Error as error:
+                log(f"pipeline rebuild failed, retrying: {error.message}")
+                self.schedule_restart()
+                return False
             self.stream.start()
+        return False
+
+    def schedule_restart(self) -> None:
+        # Coalesce the burst of size changes a resize produces.
+        if self.pending_restart:
+            GLib.source_remove(self.pending_restart)
+        self.pending_restart = GLib.timeout_add(300, self.restart)
 
     def drop_client(self) -> None:
         if self.stream:
@@ -169,7 +174,7 @@ class Server:
         listener = socket.create_server(("0.0.0.0", self.config.port), backlog=1)
         GLib.io_add_watch(listener, GLib.IO_IN, self.accept)
         # A new framebuffer size needs new caps and an IDR.
-        self.screen.connect("size-changed", lambda *_: self.restart())
+        self.screen.connect("size-changed", lambda *_: self.schedule_restart())
         GLib.timeout_add(250, self.watchdog)
         log(f"listening on {self.config.port}")
         GLib.MainLoop().run()
