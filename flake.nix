@@ -65,6 +65,9 @@
           pkgs.gtk3 pkgs.webkitgtk_4_1 pkgs.glib pkgs.libsoup_3
           pkgs.gst_all_1.gstreamer pkgs.gst_all_1.gst-plugins-base
           pkgs.gst_all_1.gst-plugins-good
+          # WebCodecs H.264 for the NVENC video transport: nvcodec (NVDEC) in
+          # -bad, avdec as the software fallback.
+          pkgs.gst_all_1.gst-plugins-bad pkgs.gst_all_1.gst-libav
         ];
         desktopItems = [ (pkgs.makeDesktopItem {
           name = "docker-vm";

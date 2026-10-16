@@ -29,7 +29,7 @@ grep -q 'MountOption::RO' "$root/viewer/src-tauri/src/zipfs.rs"
 if grep -qE 'AllowOther|AllowRoot|SessionACL::(All|RootAndOwner)|allow_other|allow_root' "$root/viewer/src-tauri/src/zipfs.rs"; then echo 'archive mount must stay owner-only' >&2; exit 1; fi
 grep -q '"read_only":true,"bind":{{"propagation":"rslave"' "$root/viewer/src-tauri/src/session.rs"
 bash -n "$root/scripts/preflight" "$root/images/desktop/ephemeral-session" "$root/scripts/build" "$root/viewer/launch"
-node --test "$root/tests/physical-pixels.mjs"
+node --test "$root/tests/physical-pixels.mjs" "$root/tests/video-transport.mjs"
 python3 "$root/tests/display-scale.py"
 SESSION_RUNTIME_DIR=/tmp SESSION_UID=1000 SESSION_GID=1000 docker compose -f "$root/compose.yaml" config >/dev/null
 echo 'validation behavior tests: PASS'

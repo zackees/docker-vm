@@ -32,6 +32,10 @@ pub struct Connection {
   pub websocket_url: String,
   pub capability: String,
   pub vnc_password: String,
+  /// Hardware H.264 stream (GPU mode with NVENC only); same one-use
+  /// capability scheme as RFB, its own capability.
+  pub video_url: Option<String>,
+  pub video_capability: Option<String>,
 }
 
 /// An archive opened, with its password verified, before any container starts.
@@ -52,7 +56,9 @@ pub struct SessionManager {
   archive_mounts: Mutex<Vec<BackgroundSession>>,
   progress: Arc<Progress>,
   startup: Mutex<Option<thread::JoinHandle<()>>>,
-  shutdown: Mutex<Option<watch::Sender<bool>>>,
+  shutdown: Mutex<Vec<watch::Sender<bool>>>,
+  // Set when the container was started with the NVENC video service.
+  video: AtomicBool,
   // RFB bytes forwarded to the viewer; read only by `DOCKER_VM_STATS` reports.
   bridged_bytes: Arc<AtomicU64>,
 }
@@ -148,7 +154,7 @@ impl SessionManager {
     });
     let manager = Arc::new(Self {
       root, project, overrides: Mutex::new(overrides), mounts_dir, mount_points,
-      archive_mounts: Mutex::new(Vec::new()), progress, startup: Mutex::new(None), shutdown: Mutex::new(None),
+      archive_mounts: Mutex::new(Vec::new()), progress, startup: Mutex::new(None), shutdown: Mutex::new(Vec::new()), video: AtomicBool::new(false),
       bridged_bytes: Arc::new(AtomicU64::new(0)),
     });
     let password = secret(24)?;
@@ -203,8 +209,28 @@ impl SessionManager {
     wait_for_vnc(vnc, progress)?;
     let capability = secret(32)?;
     let (address, shutdown) = bridge(vnc, capability.clone(), Arc::clone(&self.bridged_bytes))?;
-    *self.shutdown.lock().map_err(|_| "shutdown lock unavailable")? = Some(shutdown);
-    Ok(Connection { websocket_url: format!("ws://{address}"), capability, vnc_password: password })
+    self.shutdown.lock().map_err(|_| "shutdown lock unavailable")?.push(shutdown);
+    let (video_url, video_capability) = match self.video_bridge(vnc.ip())? {
+      Some((address, capability)) => (Some(format!("ws://{address}")), Some(capability)),
+      None => (None, None),
+    };
+    Ok(Connection { websocket_url: format!("ws://{address}"), capability, vnc_password: password, video_url, video_capability })
+  }
+
+  /// Bridges the container's NVENC stream if its service came up. It exits
+  /// by itself when NVENC cannot open a session; the session then stays on
+  /// RFB frames.
+  fn video_bridge(&self, container: std::net::IpAddr) -> Result<Option<(SocketAddr, String)>, String> {
+    if !self.video.load(Ordering::Acquire) { return Ok(None); }
+    let address = SocketAddr::new(container, VIDEO_PORT);
+    if !wait_for_port(address, Duration::from_secs(8), &self.progress) {
+      eprintln!("hardware video unavailable; using VNC frames");
+      return Ok(None);
+    }
+    let capability = secret(32)?;
+    let (bridged, shutdown) = bridge(address, capability.clone(), Arc::clone(&self.bridged_bytes))?;
+    self.shutdown.lock().map_err(|_| "shutdown lock unavailable")?.push(shutdown);
+    Ok(Some((bridged, capability)))
   }
 
   fn overrides(&self) -> Vec<PathBuf> {
@@ -224,13 +250,16 @@ impl SessionManager {
     progress.stage(&format!("Starting desktop container (GPU rendering on {device})…"));
     // Beside the session directory, so the container never sees it.
     let file = self.root.with_extension("gpu.yaml");
-    write_secret(&file, gpu_override(device).as_bytes())?;
+    let video = video_devices(device);
+    write_secret(&file, gpu_override(device, video.as_ref()).as_bytes())?;
+    self.video.store(video.is_some(), Ordering::Release);
     self.overrides.lock().map_err(|_| "override lock unavailable")?.push(file.clone());
     match self.up() {
       Err(error) if !progress.stopping() => {
         eprintln!("GPU rendering unavailable ({error}); falling back to CPU");
         let _ = compose(&self.project, &self.root, &self.overrides(), "down", &["--remove-orphans", "--timeout", "0"]);
         self.overrides.lock().map_err(|_| "override lock unavailable")?.retain(|path| path != &file);
+        self.video.store(false, Ordering::Release);
         let _ = fs::remove_file(&file);
         progress.stage(&format!("Starting desktop container (CPU rendering: {device} failed to start)…"));
         self.up()
@@ -269,7 +298,7 @@ impl SessionManager {
   pub fn stop(&self) {
     let first = !self.progress.stopping.swap(true, Ordering::AcqRel);
     self.progress.kill();
-    if let Ok(mut shutdown) = self.shutdown.lock() && let Some(shutdown) = shutdown.take() { let _ = shutdown.send(true); }
+    if let Ok(mut shutdown) = self.shutdown.lock() { for sender in shutdown.drain(..) { let _ = sender.send(true); } }
     // Wait for the worker so a half-finished `up` cannot recreate the
     // container after `down`.
     let handle = self.startup.lock().ok().and_then(|mut handle| handle.take());
@@ -408,10 +437,50 @@ fn pick_gpu(devices: &str) -> Option<String> {
     .map(|(_, digits)| format!("nvidia.com/gpu={digits}"))
 }
 
+const VIDEO_PORT: u16 = 5901;
+
+/// What the container needs for NVENC on the chosen GPU.
+#[derive(Debug, PartialEq)]
+struct VideoDevices {
+  /// CUDA index of the chosen GPU under CUDA_DEVICE_ORDER=PCI_BUS_ID.
+  cuda_index: u32,
+  /// Bare /dev/nvidiaN nodes of the other GPUs. With only the chosen GPU's
+  /// node present, this driver refuses NVENC sessions ("unsupported
+  /// device"); CUDA itself stays pinned to the chosen GPU.
+  other_nodes: Vec<String>,
+}
+
+/// NVENC needs for `nvidia.com/gpu=N`, unless `DOCKER_VM_VIDEO=off`. The CDI
+/// index N is the driver's PCI-ordered index, so it is also the CUDA index
+/// under PCI_BUS_ID ordering and the minor of /dev/nvidiaN.
+fn video_devices(device: &str) -> Option<VideoDevices> {
+  if std::env::var_os("DOCKER_VM_VIDEO").is_some_and(|value| value == "off") { return None; }
+  let cuda_index: u32 = device.strip_prefix("nvidia.com/gpu=")?.parse().ok()?;
+  let nodes = fs::read_dir("/dev").ok()?.filter_map(|entry| entry.ok()?.file_name().into_string().ok());
+  Some(VideoDevices { cuda_index, other_nodes: other_gpu_nodes(nodes, cuda_index) })
+}
+
+fn other_gpu_nodes(names: impl Iterator<Item = String>, chosen: u32) -> Vec<String> {
+  let mut nodes: Vec<String> = names
+    .filter(|name| name.strip_prefix("nvidia").and_then(|index| index.parse::<u32>().ok()).is_some_and(|index| index != chosen))
+    .map(|name| format!("/dev/{name}"))
+    .collect();
+  nodes.sort();
+  nodes
+}
+
 /// Compose override adding the CDI device and telling the session script to
-/// enable Chromium's GPU path.
-fn gpu_override(device: &str) -> String {
-  format!(r#"{{"services":{{"desktop":{{"devices":[{}],"environment":{{"DESKTOP_GPU":"nvidia"}}}}}}}}"#, compose_string(device))
+/// enable Chromium's GPU path, plus the NVENC video service when possible.
+fn gpu_override(device: &str, video: Option<&VideoDevices>) -> String {
+  let mut devices = vec![compose_string(device)];
+  let mut environment = vec![r#""DESKTOP_GPU":"nvidia""#.to_string()];
+  if let Some(video) = video {
+    devices.extend(video.other_nodes.iter().map(|node| compose_string(node)));
+    environment.push(r#""DESKTOP_VIDEO":"nvenc""#.into());
+    environment.push(r#""CUDA_DEVICE_ORDER":"PCI_BUS_ID""#.into());
+    environment.push(format!(r#""DESKTOP_VIDEO_CUDA_DEVICE":"{}""#, video.cuda_index));
+  }
+  format!(r#"{{"services":{{"desktop":{{"devices":[{}],"environment":{{{}}}}}}}}}"#, devices.join(","), environment.join(","))
 }
 
 fn compose_string(value: &str) -> String {
@@ -596,6 +665,15 @@ fn ensure_image(progress: &Arc<Progress>) -> Result<(), String> {
   progress.run(build, "desktop image build")
 }
 
+fn wait_for_port(address: SocketAddr, limit: Duration, progress: &Progress) -> bool {
+  let deadline = std::time::Instant::now() + limit;
+  while std::time::Instant::now() < deadline && !progress.stopping() {
+    if std::net::TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_ok() { return true; }
+    thread::sleep(Duration::from_millis(200));
+  }
+  false
+}
+
 fn bridge(vnc: SocketAddr, capability: String, bytes: Arc<AtomicU64>) -> Result<(SocketAddr, watch::Sender<bool>), String> {
   let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|error| format!("bind bridge: {error}"))?;
   let address = listener.local_addr().map_err(|error| error.to_string())?;
@@ -679,9 +757,24 @@ mod tests {
   #[test]
   fn gpu_override_adds_the_cdi_device() {
     assert_eq!(
-      gpu_override("nvidia.com/gpu=0"),
+      gpu_override("nvidia.com/gpu=0", None),
       r#"{"services":{"desktop":{"devices":["nvidia.com/gpu=0"],"environment":{"DESKTOP_GPU":"nvidia"}}}}"#,
     );
+  }
+
+  #[test]
+  fn gpu_override_adds_nvenc_service_and_other_gpu_nodes() {
+    let video = VideoDevices { cuda_index: 0, other_nodes: vec!["/dev/nvidia1".into()] };
+    assert_eq!(
+      gpu_override("nvidia.com/gpu=0", Some(&video)),
+      r#"{"services":{"desktop":{"devices":["nvidia.com/gpu=0","/dev/nvidia1"],"environment":{"DESKTOP_GPU":"nvidia","DESKTOP_VIDEO":"nvenc","CUDA_DEVICE_ORDER":"PCI_BUS_ID","DESKTOP_VIDEO_CUDA_DEVICE":"0"}}}}"#,
+    );
+  }
+
+  #[test]
+  fn other_gpu_nodes_skip_the_chosen_gpu_and_control_nodes() {
+    let names = ["nvidia0", "nvidia1", "nvidia2", "nvidiactl", "nvidia-uvm", "nvidia-modeset", "null"].map(String::from);
+    assert_eq!(other_gpu_nodes(names.into_iter(), 1), vec!["/dev/nvidia0", "/dev/nvidia2"]);
   }
 
   #[test]

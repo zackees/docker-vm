@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""NVENC H.264 stream of the X display for the private desktop viewer.
+
+Started by ephemeral-session only in GPU mode (DESKTOP_VIDEO=nvenc). It first
+proves NVENC can open a session; if not, it exits and the viewer keeps using
+VNC frames. Otherwise it listens on TCP 5901 (container network only; never
+published) for one client at a time and, while a client is connected, captures
+the display with ximagesrc, encodes with nvh264enc and sends each access unit:
+
+    u32 payload length | u8 flags (bit 0 = keyframe) | u64 pts (us) | Annex-B AU
+
+All big-endian. The pipeline restarts, starting with an IDR, whenever the X
+framebuffer size changes. Input never comes through here: keyboard, pointer and
+resize stay on RFB.
+"""
+from __future__ import annotations
+
+import os
+import socket
+import struct
+import sys
+import threading
+from dataclasses import dataclass
+
+import gi
+
+gi.require_version("Gst", "1.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, GLib, Gst  # noqa: E402
+
+HEADER = struct.Struct(">IBQ")
+KEYFRAME = 1
+
+
+@dataclass(frozen=True)
+class Config:
+    port: int = 5901
+    cuda_device: int = 0
+    fps: int = 60
+    bitrate_kbps: int = 25000
+    gop_frames: int = 120
+
+    @classmethod
+    def from_env(cls) -> Config:
+        return cls(cuda_device=int(os.environ.get("DESKTOP_VIDEO_CUDA_DEVICE", "0")))
+
+
+@dataclass(frozen=True)
+class Size:
+    width: int
+    height: int
+
+
+def log(message: str) -> None:
+    print(f"video-stream: {message}", file=sys.stderr, flush=True)
+
+
+def encoder(config: Config) -> str:
+    return (f"nvh264enc preset=p1 tune=ultra-low-latency zerolatency=true "
+            f"rc-mode=cbr bitrate={config.bitrate_kbps} gop-size={config.gop_frames} bframes=0")
+
+
+def self_test(config: Config) -> bool:
+    """NVENC can fail to open a session even when the element exists."""
+    try:
+        pipeline = Gst.parse_launch(
+            f"videotestsrc num-buffers=3 ! video/x-raw,width=320,height=240,format=BGRx ! cudaupload ! "
+            f"{encoder(config)} ! fakesink")
+    except GLib.Error as error:
+        log(f"encoder unavailable: {error.message}")
+        return False
+    pipeline.set_state(Gst.State.PLAYING)
+    message = pipeline.get_bus().timed_pop_filtered(10 * Gst.SECOND, Gst.MessageType.EOS | Gst.MessageType.ERROR)
+    pipeline.set_state(Gst.State.NULL)
+    if message is None or message.type == Gst.MessageType.ERROR:
+        log(f"encoder self-test failed: {message.parse_error()[0].message if message else 'timeout'}")
+        return False
+    return True
+
+
+class Stream:
+    """One capture/encode pipeline feeding one connected client."""
+
+    def __init__(self, config: Config, client: socket.socket, size: Size) -> None:
+        self.client = client
+        self.failed = threading.Event()
+        # A leaky queue drops raw frames, never encoded ones, when the client
+        # or encoder falls behind, so every sent P-frame still decodes.
+        self.pipeline = Gst.parse_launch(
+            f"ximagesrc display-name=:0 use-damage=false show-pointer=false ! "
+            f"video/x-raw,framerate={config.fps}/1,width={size.width},height={size.height} ! "
+            f"queue leaky=downstream max-size-buffers=1 max-size-time=0 max-size-bytes=0 ! "
+            f"cudaupload ! {encoder(config)} ! h264parse config-interval=-1 ! "
+            f"video/x-h264,stream-format=byte-stream,alignment=au ! "
+            f"appsink name=sink emit-signals=true sync=false max-buffers=1 drop=false")
+        self.pipeline.get_by_name("sink").connect("new-sample", self.on_sample)
+        bus = self.pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message::error", self.on_error)
+
+    def on_sample(self, sink: Gst.Element) -> Gst.FlowReturn:
+        buffer = sink.emit("pull-sample").get_buffer()
+        ok, info = buffer.map(Gst.MapFlags.READ)
+        if not ok:
+            return Gst.FlowReturn.ERROR
+        try:
+            flags = 0 if buffer.has_flags(Gst.BufferFlags.DELTA_UNIT) else KEYFRAME
+            pts = buffer.pts // 1000 if buffer.pts != Gst.CLOCK_TIME_NONE else 0
+            self.client.sendall(HEADER.pack(len(info.data), flags, pts) + bytes(info.data))
+        except OSError:
+            self.failed.set()
+            return Gst.FlowReturn.EOS
+        finally:
+            buffer.unmap(info)
+        return Gst.FlowReturn.OK
+
+    def on_error(self, _bus: Gst.Bus, message: Gst.Message) -> None:
+        log(f"pipeline error: {message.parse_error()[0].message}")
+        self.failed.set()
+
+    def start(self) -> None:
+        self.pipeline.set_state(Gst.State.PLAYING)
+
+    def stop(self) -> None:
+        self.pipeline.set_state(Gst.State.NULL)
+
+
+class Server:
+    def __init__(self, config: Config) -> None:
+        self.config = config
+        self.screen = Gdk.Screen.get_default()
+        self.client: socket.socket | None = None
+        self.stream: Stream | None = None
+
+    def size(self) -> Size:
+        root = self.screen.get_root_window()
+        return Size(root.get_width(), root.get_height())
+
+    def restart(self) -> None:
+        if self.stream:
+            self.stream.stop()
+            self.stream = None
+        if self.client:
+            self.stream = Stream(self.config, self.client, self.size())
+            self.stream.start()
+
+    def drop_client(self) -> None:
+        if self.stream:
+            self.stream.stop()
+            self.stream = None
+        if self.client:
+            self.client.close()
+            self.client = None
+
+    def accept(self, listener: socket.socket, _condition: GLib.IOCondition) -> bool:
+        client, _ = listener.accept()
+        client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.drop_client()  # One viewer: the newest connection wins.
+        self.client = client
+        self.restart()
+        return True
+
+    def watchdog(self) -> bool:
+        if self.stream and self.stream.failed.is_set():
+            self.drop_client()
+        return True
+
+    def run(self) -> None:
+        listener = socket.create_server(("0.0.0.0", self.config.port), backlog=1)
+        GLib.io_add_watch(listener, GLib.IO_IN, self.accept)
+        # A new framebuffer size needs new caps and an IDR.
+        self.screen.connect("size-changed", lambda *_: self.restart())
+        GLib.timeout_add(250, self.watchdog)
+        log(f"listening on {self.config.port}")
+        GLib.MainLoop().run()
+
+
+def main() -> int:
+    config = Config.from_env()
+    # nvh264enc always uses CUDA device 0 of what is visible; show CUDA only
+    # the chosen GPU (index under CUDA_DEVICE_ORDER=PCI_BUS_ID).
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(config.cuda_device)
+    Gst.init(None)
+    Gdk.init([])
+    if not self_test(config):
+        return 0
+    Server(config).run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

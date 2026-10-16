@@ -44,7 +44,7 @@ fn main() {
   tauri::Builder::default()
     .runtime(tauri_runtime_wry::Wry::default())
     .manage(manager)
-    .invoke_handler(tauri::generate_handler![status, connection, set_display_scale, stats_enabled, report_stats, rfb_tuning])
+    .invoke_handler(tauri::generate_handler![status, connection, set_display_scale, stats_enabled, report_stats, rfb_tuning, video_event])
     .setup(|app| {
       WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
         .title("Private desktop canvas")
@@ -103,6 +103,13 @@ struct RfbTuning { quality: Option<u8>, compression: Option<u8> }
 fn rfb_tuning() -> RfbTuning {
   let level = |name: &str| std::env::var(name).ok()?.parse::<u8>().ok().filter(|level| *level <= 9);
   RfbTuning { quality: level("DOCKER_VM_RFB_QUALITY"), compression: level("DOCKER_VM_RFB_COMPRESSION") }
+}
+
+/// Hardware-video transport state from the UI (started, or why it fell back
+/// to RFB frames), for the session log.
+#[tauri::command]
+fn video_event(message: String) {
+  eprintln!("video: {}", message.chars().filter(|c| !c.is_control()).take(200).collect::<String>());
 }
 
 #[tauri::command]
