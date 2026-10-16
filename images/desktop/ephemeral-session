@@ -38,7 +38,7 @@ display-scale --prepare
 # device. Chromium then rasterizes and runs WebGL/WebGPU through ANGLE on the
 # driver's Vulkan device. Xvnc has no GPU, so a GPU-composited window cannot be
 # presented to it (the window stays black); compositing therefore stays in
-# software, which hands finished frames to X. tests/gpu-render.sh checks the
+# software, which hands finished frames to X. tests/gpu_render.py checks the
 # actual pixels. Without a GPU the CPU path is unchanged: software rendering
 # with the GPU process off.
 if [[ ${DESKTOP_GPU:-} == nvidia ]]; then

@@ -54,7 +54,7 @@ update, then rerun preflight, pairing, and all live gates.
 
 ## VNC baseline (2026-10-16)
 
-`tests/perf/bench.sh` with the viewer's `DOCKER_VM_STATS=1` counters: a
+`tests/perf/bench.py` with the viewer's `DOCKER_VM_STATS=1` counters: a
 full-screen canvas animation in a GPU-mode session (RTX 3060, ANGLE/Vulkan
 raster, software compositing), host load average ~45-50. "Content fps" is the
 number of distinct page frames the viewer actually painted (frame-stamp block),

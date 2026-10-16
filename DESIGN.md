@@ -51,7 +51,7 @@ hold, a per-session compose override attaches the lowest-numbered GPU (never
 `=all`) and sets `DESKTOP_GPU=nvidia`; Chromium then rasterizes and runs WebGL/WebGPU through
 ANGLE on the driver's Vulkan device. Compositing stays in software: Xvnc has
 no GPU, and a GPU-composited window cannot be presented to it (it stays black),
-so finished frames are handed to X in software. `tests/gpu-render.sh` checks
+so finished frames are handed to X in software. `tests/gpu_render.py` checks
 the framebuffer pixels, not just `chrome://gpu`.
 The RFB transport is unchanged. If any check fails, or the container cannot
 start with the device, the session uses the CPU path: software rendering with
