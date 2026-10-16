@@ -20,6 +20,11 @@ use gstreamer_app as gst_app;
 /// The service starts with the desktop; give it as long as video gets.
 const CONNECT_WINDOW: Duration = Duration::from_secs(30);
 const MAX_PACKET: usize = 64 << 10;
+/// Audio older than this before the sink is dropped, not queued: packets that
+/// arrive while the sink starts (or faster than it plays, as the two clocks
+/// drift) would otherwise delay everything after them for good. Measured
+/// before the cap: about a second behind the video.
+const QUEUE_NS: u64 = 40_000_000;
 
 #[derive(Default)]
 pub struct NativeAudio {
@@ -33,9 +38,16 @@ impl NativeAudio {
     if self.started.swap(true, Ordering::AcqRel) { return; }
     let stop = Arc::clone(&self.stop);
     thread::spawn(move || {
-      match play(address, &stop) {
-        Ok(()) => eprintln!("audio: stream ended"),
-        Err(reason) => eprintln!("audio unavailable: {reason}"),
+      // The container restarts its audio service if it exits; follow it.
+      while !stop.load(Ordering::Acquire) {
+        match play(address, &stop) {
+          Ok(()) => eprintln!("audio: stream ended"),
+          Err(reason) => {
+            eprintln!("audio unavailable: {reason}");
+            if reason.starts_with("connect") { return; }
+          }
+        }
+        thread::sleep(Duration::from_secs(1));
       }
     });
   }
@@ -61,14 +73,15 @@ fn play(address: SocketAddr, stop: &AtomicBool) -> Result<(), String> {
   stream.set_read_timeout(Some(Duration::from_millis(500))).ok();
   // Low latency over smoothness: no clock sync, a small sink buffer.
   let sink = if gst::ElementFactory::find("pulsesink").is_some() {
-    "pulsesink buffer-time=60000 latency-time=10000 sync=false"
+    "pulsesink buffer-time=40000 latency-time=10000 sync=false"
   } else {
     "autoaudiosink sync=false"
   };
   let pipeline = gst::parse_launch(&format!(
     "appsrc name=src is-live=true format=time do-timestamp=true \
        caps=audio/x-opus,channels=2,rate=48000,channel-mapping-family=0 ! \
-     opusdec ! audioconvert ! audioresample ! {sink}"))
+     opusdec ! audioconvert ! audioresample ! \
+     queue leaky=downstream max-size-buffers=0 max-size-bytes=0 max-size-time={QUEUE_NS} ! {sink}"))
     .map_err(|error| format!("pipeline: {error}"))?
     .downcast::<gst::Pipeline>()
     .map_err(|_| "pipeline is not a pipeline")?;
