@@ -1,16 +1,17 @@
 use std::{
   fs::{self, File},
-  io::Write,
+  io::{self, BufRead, Write},
   net::SocketAddr,
   os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
   path::{Path, PathBuf},
-  process::Command,
+  process::{Child, Command, Stdio},
   sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}},
   thread,
   time::Duration,
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use fuser::BackgroundSession;
 use futures_util::{SinkExt, StreamExt};
 use http::{HeaderValue, StatusCode};
 use serde::Serialize;
@@ -18,7 +19,13 @@ use tokio::{io::AsyncWriteExt, net::{TcpListener, TcpStream}, sync::watch};
 use tokio_tungstenite::{accept_hdr_async, tungstenite::{handshake::server::{Request, Response}, protocol::Message}};
 use uuid::Uuid;
 
+use crate::{
+  mounts::{Options, ZipMount},
+  zipfs::{self, Archive, Password, ZipFs},
+};
+
 const VIEWER_ORIGIN: &str = "tauri://localhost";
+const PASSWORD_ATTEMPTS: usize = 3;
 
 #[derive(Clone, Serialize)]
 pub struct Connection {
@@ -27,46 +34,179 @@ pub struct Connection {
   pub vnc_password: String,
 }
 
+/// An archive opened, with its password verified, before any container starts.
+pub struct PreparedMount {
+  target: String,
+  archive: Archive,
+  password: Option<Password>,
+}
+
 pub struct SessionManager {
   root: PathBuf,
   project: String,
-  connection: Mutex<Option<Connection>>,
-  shutdown: watch::Sender<bool>,
+  overrides: Vec<PathBuf>,
+  mounts_dir: PathBuf,
+  mount_points: Vec<PathBuf>,
+  archive_mounts: Mutex<Vec<BackgroundSession>>,
+  progress: Arc<Progress>,
+  startup: Mutex<Option<thread::JoinHandle<()>>>,
+  shutdown: Mutex<Option<watch::Sender<bool>>>,
+}
+
+/// What the window shows while the session starts. Polled by the UI, so the
+/// window never waits on Docker before it can paint.
+#[derive(Clone, Serialize)]
+#[serde(tag = "state", rename_all = "lowercase")]
+pub enum Status {
+  Starting { stage: String, log: Vec<String> },
+  // The capability is fetched once through `connection`, never polled.
+  Ready { #[serde(skip)] connection: Connection },
+  Failed { error: String, log: Vec<String> },
+}
+
+const LOG_LINES: usize = 12;
+
+/// Shared startup state plus the running child process, so closing the window
+/// mid-build kills Docker instead of waiting for it.
+struct Progress {
+  status: Mutex<Status>,
+  child: Mutex<Option<Child>>,
+  stopping: AtomicBool,
+}
+
+impl Progress {
+  fn stage(&self, stage: &str) {
+    if let Ok(mut status) = self.status.lock() {
+      *status = Status::Starting { stage: stage.into(), log: Vec::new() };
+    }
+  }
+
+  fn line(&self, line: &str) {
+    let line = line.trim();
+    if line.is_empty() { return; }
+    if let Ok(mut status) = self.status.lock() && let Status::Starting { log, .. } = &mut *status {
+      if log.len() == LOG_LINES { log.remove(0); }
+      log.push(line.chars().take(240).collect());
+    }
+  }
+
+  fn stopping(&self) -> bool { self.stopping.load(Ordering::Acquire) }
+
+  /// Runs a command, streaming its merged output into the status log.
+  fn run(self: &Arc<Self>, mut command: Command, what: &str) -> Result<(), String> {
+    if self.stopping() { return Err("session cancelled".into()); }
+    let mut child = command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
+      .map_err(|error| format!("start {what}: {error}"))?;
+    let readers: Vec<_> = [child.stdout.take().map(|out| Box::new(out) as Box<dyn io::Read + Send>), child.stderr.take().map(|err| Box::new(err) as Box<dyn io::Read + Send>)]
+      .into_iter().flatten().map(|stream| {
+        let progress = Arc::clone(self);
+        thread::spawn(move || {
+          for line in io::BufReader::new(stream).lines().map_while(Result::ok) {
+            eprintln!("{line}");
+            progress.line(&line);
+          }
+        })
+      }).collect();
+    *self.child.lock().map_err(|_| "child lock unavailable")? = Some(child);
+    for reader in readers { let _ = reader.join(); }
+    let child = self.child.lock().map_err(|_| "child lock unavailable")?.take();
+    let status = match child { Some(mut child) => child.wait().map_err(|error| error.to_string())?, None => return Err("session cancelled".into()) };
+    if self.stopping() { return Err("session cancelled".into()); }
+    status.success().then_some(()).ok_or_else(|| format!("{what} failed ({status})"))
+  }
+
+  fn kill(&self) {
+    self.stopping.store(true, Ordering::Release);
+    if let Ok(mut child) = self.child.lock() && let Some(child) = child.as_mut() {
+      let _ = child.kill();
+    }
+  }
 }
 
 impl SessionManager {
-  pub fn start() -> Result<Self, String> {
+  /// Prepares the private session directory and returns immediately; Docker
+  /// work (image build, container start, VNC wait) runs on a worker thread.
+  pub fn start(mounts: Vec<PreparedMount>) -> Result<Arc<Self>, String> {
     let runtime = runtime_dir()?;
     ensure_tmpfs(&runtime)?;
     let project = format!("docker-vm-{}", Uuid::new_v4().simple());
     let root = runtime.join(&project);
     fs::create_dir(&root).map_err(|error| format!("create session directory: {error}"))?;
     fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).map_err(|error| error.to_string())?;
-
+    // Outside `root`, which the container already sees at /run/session.
+    let mounts_dir = runtime.join(format!("{project}.mounts"));
+    let mount_points: Vec<PathBuf> = (0..mounts.len()).map(|index| mounts_dir.join(index.to_string())).collect();
+    let overrides = if mounts.is_empty() { Vec::new() } else { vec![mounts_dir.join("compose.yaml")] };
+    let progress = Arc::new(Progress {
+      status: Mutex::new(Status::Starting { stage: "Preparing private session…".into(), log: Vec::new() }),
+      child: Mutex::new(None),
+      stopping: AtomicBool::new(false),
+    });
+    let manager = Arc::new(Self {
+      root, project, overrides, mounts_dir, mount_points,
+      archive_mounts: Mutex::new(Vec::new()), progress, startup: Mutex::new(None), shutdown: Mutex::new(None),
+    });
     let password = secret(24)?;
-    write_secret(&root.join("vnc-password"), password.as_bytes())?;
-    let result = (|| {
-      compose(&project, &root, "up", &["-d", "--build"])?;
-      let vnc = container_vnc_address(&project, &root)?;
-      wait_for_vnc(vnc)?;
-      let capability = secret(32)?;
-      let (address, shutdown) = bridge(vnc, capability.clone())?;
-      let connection = Connection { websocket_url: format!("ws://{address}"), capability, vnc_password: password };
-      Ok((connection, shutdown))
-    })();
-    match result {
-      Ok((connection, shutdown)) => Ok(Self { root, project, connection: Mutex::new(Some(connection)), shutdown }),
-      Err(error) => {
-        let _ = compose(&project, &root, "down", &["--remove-orphans"]);
-        let _ = fs::remove_dir_all(&root);
-        Err(error)
-      }
-    }
+    write_secret(&manager.root.join("vnc-password"), password.as_bytes())?;
+    let worker = Arc::clone(&manager);
+    let handle = thread::spawn(move || {
+      let result = worker.launch(mounts, password);
+      let status = match result {
+        Ok(connection) => Status::Ready { connection },
+        Err(error) => {
+          eprintln!("private session failed: {error}");
+          let log = match worker.progress.status.lock().map(|status| status.clone()) { Ok(Status::Starting { log, .. }) => log, _ => Vec::new() };
+          Status::Failed { error, log }
+        }
+      };
+      if let Ok(mut current) = worker.progress.status.lock() { *current = status; }
+    });
+    *manager.startup.lock().map_err(|_| "startup lock unavailable")? = Some(handle);
+    Ok(manager)
   }
 
-  pub fn connection(&self) -> Option<Connection> {
-    self.connection.lock().ok()?.clone()
+  fn launch(&self, mounts: Vec<PreparedMount>, password: String) -> Result<Connection, String> {
+    let progress = &self.progress;
+    if !mounts.is_empty() {
+      ensure_mount_owner(&self.root)?;
+      ensure_propagating(self.mounts_dir.parent().ok_or("runtime directory missing")?)?;
+      for directory in std::iter::once(&self.mounts_dir).chain(&self.mount_points) {
+        create_private_dir(directory)?;
+      }
+      let binds: Vec<(&Path, &str)> = self.mount_points.iter().map(PathBuf::as_path).zip(mounts.iter().map(|mount| mount.target.as_str())).collect();
+      write_secret(&self.overrides[0], mount_override(&binds)?.as_bytes())?;
+    }
+    ensure_image(progress)?;
+    progress.stage("Starting desktop container…");
+    let mut up = compose_command(&self.project, &self.root, &self.overrides)?;
+    up.args(["up", "-d", "--no-build"]);
+    progress.run(up, "docker compose up")?;
+    // Mount only once the container exists: its rslave binds receive the FUSE
+    // mounts, so Docker (root) never needs access to them.
+    let owner = self.root.metadata().map_err(|error| error.to_string())?;
+    for (mount, point) in mounts.into_iter().zip(&self.mount_points) {
+      let session = zipfs::mount(ZipFs::new(mount.archive, mount.password, owner.uid(), owner.gid()), point)?;
+      self.archive_mounts.lock().map_err(|_| "archive mount lock unavailable")?.push(session);
+    }
+    progress.stage("Waiting for the desktop to accept connections…");
+    let vnc = container_vnc_address(&self.project, &self.root, &self.overrides)?;
+    wait_for_vnc(vnc, progress)?;
+    let capability = secret(32)?;
+    let (address, shutdown) = bridge(vnc, capability.clone())?;
+    *self.shutdown.lock().map_err(|_| "shutdown lock unavailable")? = Some(shutdown);
+    Ok(Connection { websocket_url: format!("ws://{address}"), capability, vnc_password: password })
   }
+
+  pub fn status(&self) -> Status {
+    self.progress.status.lock().map(|status| status.clone()).unwrap_or(Status::Failed { error: "status unavailable".into(), log: Vec::new() })
+  }
+
+  /// Hands out the one-use bridge capability only once the session is ready.
+  pub fn connection(&self) -> Option<Connection> {
+    match &*self.progress.status.lock().ok()? { Status::Ready { connection } => Some(connection.clone()), _ => None }
+  }
+
+  fn live(&self) -> bool { !self.progress.stopping() }
 
   pub fn set_display_scale(&self, scale: f64) -> Result<(), String> {
     if !scale.is_finite() || !(0.5..=4.0).contains(&scale) {
@@ -74,19 +214,27 @@ impl SessionManager {
     }
     // Serialize writes with session teardown. Only this numeric setting crosses
     // the read-only container bind; no shell, Docker, or arbitrary-path API.
-    let live = self.connection.lock().map_err(|_| "session lock unavailable")?;
-    if live.is_none() { return Err("session ended".into()); }
+    let _status = self.progress.status.lock().map_err(|_| "session lock unavailable")?;
+    if !self.live() { return Err("session ended".into()); }
     let temporary = self.root.join("display-scale.next");
     fs::write(&temporary, scale.to_string()).map_err(|_| "cannot write display scale")?;
     fs::rename(temporary, self.root.join("display-scale")).map_err(|_| "cannot publish display scale".into())
   }
 
   pub fn stop(&self) {
-    let _ = self.shutdown.send(true);
-    let was_live = self.connection.lock().map(|mut connection| connection.take().is_some()).unwrap_or(false);
-    if was_live {
-      let _ = compose(&self.project, &self.root, "down", &["--remove-orphans"]);
+    let first = !self.progress.stopping.swap(true, Ordering::AcqRel);
+    self.progress.kill();
+    if let Ok(mut shutdown) = self.shutdown.lock() && let Some(shutdown) = shutdown.take() { let _ = shutdown.send(true); }
+    // Wait for the worker so a half-finished `up` cannot recreate the
+    // container after `down`.
+    let handle = self.startup.lock().ok().and_then(|mut handle| handle.take());
+    if let Some(handle) = handle && handle.thread().id() != thread::current().id() { let _ = handle.join(); }
+    // RAM-only session: nothing to flush, so skip Docker's 10 s stop grace.
+    if first {
+      let _ = compose(&self.project, &self.root, &self.overrides, "down", &["--remove-orphans", "--timeout", "0"]);
     }
+    // Archives stay mounted until the container is gone.
+    release_archives(&self.archive_mounts, &self.mounts_dir, &self.mount_points, &self.overrides);
     // Do not remove a non-tmpfs path. `start` only creates this after tmpfs
     // verification; removal is merely prompt release, not the privacy control.
     let _ = fs::remove_dir_all(&self.root);
@@ -94,6 +242,127 @@ impl SessionManager {
 }
 
 impl Drop for SessionManager { fn drop(&mut self) { self.stop(); } }
+
+/// Opens every archive and obtains a verified password before any container
+/// starts, so a wrong password fails fast and leaves no session behind.
+pub fn prepare_mounts(options: &Options) -> Result<Vec<PreparedMount>, String> {
+  let stdin = if options.password_stdin { Some(stdin_password()?) } else { None };
+  options.mounts.iter().map(|mount| -> Result<PreparedMount, String> {
+    let mut archive = Archive::open(&mount.source)?;
+    let password = if archive.is_encrypted() { Some(archive_password(&mut archive, mount, stdin.as_ref())?) } else { None };
+    Ok(PreparedMount { target: mount.target.clone(), archive, password })
+  }).collect()
+}
+
+fn archive_password(archive: &mut Archive, mount: &ZipMount, stdin: Option<&Password>) -> Result<Password, String> {
+  let source = mount.source.display();
+  let (password, origin) = match (&mount.password_file, stdin) {
+    (Some(file), _) => (read_password_file(file)?, format!("password-file {}", file.display())),
+    (None, Some(password)) => (password.duplicate(), "standard input".to_string()),
+    (None, None) => {
+      for attempt in 0..PASSWORD_ATTEMPTS {
+        let password = prompt_password(&mount.source, attempt > 0)?;
+        if archive.check_password(&password)? { return Ok(password); }
+      }
+      return Err(format!("wrong password for {source}"));
+    }
+  };
+  if archive.check_password(&password)? { Ok(password) } else { Err(format!("wrong password for {source} from {origin}")) }
+}
+
+fn read_password_file(path: &Path) -> Result<Password, String> {
+  let describe = |error: io::Error| format!("password-file {}: {error}", path.display());
+  let metadata = fs::metadata(path).map_err(describe)?;
+  if !metadata.is_file() {
+    return Err(format!("password-file {} is not a regular file", path.display()));
+  }
+  if metadata.mode() & 0o077 != 0 {
+    return Err(format!("password-file {} must not be accessible to group or others (chmod 600)", path.display()));
+  }
+  fs::read(path).map(Password::from_line).map_err(describe)
+}
+
+fn stdin_password() -> Result<Password, String> {
+  let mut line = Vec::new();
+  io::stdin().lock().read_until(b'\n', &mut line).map_err(|error| format!("--password-stdin: {error}"))?;
+  let password = Password::from_line(line);
+  if password.is_empty() { return Err("--password-stdin: no password on standard input".into()); }
+  Ok(password)
+}
+
+fn prompt_password(archive: &Path, retry: bool) -> Result<Password, String> {
+  let name = archive.file_name().unwrap_or(archive.as_os_str()).to_string_lossy();
+  let title = if retry { format!("Wrong password for {name}") } else { format!("Password for {name}") };
+  // The password returns over a private pipe, never argv or the environment.
+  let output = Command::new("zenity").args(["--password", "--title"]).arg(title).stdin(Stdio::null()).stderr(Stdio::null()).output()
+    .map_err(|error| format!("{} is encrypted; use password-file= or --password-stdin (no prompt available: {error})", archive.display()))?;
+  if !output.status.success() {
+    return Err(format!("password entry for {} was cancelled", archive.display()));
+  }
+  Ok(Password::from_line(output.stdout))
+}
+
+/// FUSE admits only the mounting user and group. The container runs as the
+/// session directory's owner, which must therefore be the viewer's real IDs.
+fn ensure_mount_owner(root: &Path) -> Result<(), String> {
+  let owner = root.metadata().map_err(|error| error.to_string())?;
+  let status = fs::read_to_string("/proc/self/status").map_err(|error| format!("read process status: {error}"))?;
+  let real = |key: &str| status.lines().find_map(|line| line.strip_prefix(key)).and_then(|ids| ids.split_whitespace().next()?.parse::<u32>().ok());
+  if real("Uid:") == Some(owner.uid()) && real("Gid:") == Some(owner.gid()) {
+    Ok(())
+  } else {
+    Err("archive mounts require the session directory to be owned by the viewer's real user and group".into())
+  }
+}
+
+fn create_private_dir(path: &Path) -> Result<(), String> {
+  fs::create_dir(path).map_err(|error| format!("create {}: {error}", path.display()))?;
+  fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|error| error.to_string())
+}
+
+/// Compose override binding each empty mount point read-only at its target.
+/// JSON is valid YAML, so values need JSON escaping plus Compose's `$$`.
+fn mount_override(binds: &[(&Path, &str)]) -> Result<String, String> {
+  let volumes = binds.iter().map(|(source, target)| -> Result<String, String> {
+    let source = source.to_str().ok_or("session runtime path is not valid UTF-8")?;
+    Ok(format!(
+      r#"{{"type":"bind","source":{},"target":{},"read_only":true,"bind":{{"propagation":"rslave","create_host_path":false}}}}"#,
+      compose_string(source),
+      compose_string(target),
+    ))
+  }).collect::<Result<Vec<_>, _>>()?;
+  Ok(format!(r#"{{"services":{{"desktop":{{"volumes":[{}]}}}}}}"#, volumes.join(",")))
+}
+
+fn compose_string(value: &str) -> String {
+  let mut quoted = String::from('"');
+  for char in value.chars() {
+    match char {
+      '"' => quoted.push_str("\\\""),
+      '\\' => quoted.push_str("\\\\"),
+      '$' => quoted.push_str("$$"),
+      char if char.is_control() => quoted.push_str(&format!("\\u{:04x}", u32::from(char))),
+      char => quoted.push(char),
+    }
+  }
+  quoted.push('"');
+  quoted
+}
+
+/// Removes archive mounts and their directories. Never recursive: a mount that
+/// is somehow still attached must not be walked.
+fn release_archives(sessions: &Mutex<Vec<BackgroundSession>>, directory: &Path, points: &[PathBuf], overrides: &[PathBuf]) {
+  // Dropping a session unmounts it through fusermount3.
+  if let Ok(mut sessions) = sessions.lock() { sessions.clear(); }
+  for point in points {
+    if matches!(fs::remove_dir(point), Err(error) if error.kind() != io::ErrorKind::NotFound) {
+      let _ = Command::new("fusermount3").arg("-uz").arg(point).stderr(Stdio::null()).status();
+      let _ = fs::remove_dir(point);
+    }
+  }
+  for file in overrides { let _ = fs::remove_file(file); }
+  let _ = fs::remove_dir(directory);
+}
 
 fn runtime_dir() -> Result<PathBuf, String> {
   let value = std::env::var_os("XDG_RUNTIME_DIR").ok_or("XDG_RUNTIME_DIR is required; refusing an arbitrary /tmp")?;
@@ -103,19 +372,40 @@ fn runtime_dir() -> Result<PathBuf, String> {
   Ok(path)
 }
 
-fn ensure_tmpfs(path: &Path) -> Result<(), String> {
+struct MountInfo {
+  target: PathBuf,
+  filesystem: String,
+  propagates: bool,
+}
+
+fn mount_info(path: &Path) -> Result<(PathBuf, MountInfo), String> {
   let canonical = path.canonicalize().map_err(|error| error.to_string())?;
   let mounts = fs::read_to_string("/proc/self/mountinfo").map_err(|error| format!("read mountinfo: {error}"))?;
   let mount = mounts.lines().filter_map(|line| {
     let (before, after) = line.split_once(" - ")?;
-    let target = before.split_whitespace().nth(4)?;
-    let filesystem = after.split_whitespace().next()?;
-    Some((PathBuf::from(target.replace("\\040", " ")), filesystem))
-  }).filter(|(target, _)| canonical.starts_with(target)).max_by_key(|(target, _)| target.as_os_str().len());
-  match mount {
-    Some((_, "tmpfs")) => Ok(()),
-    Some((target, filesystem)) => Err(format!("{canonical:?} is on {filesystem} at {target:?}, not tmpfs")),
-    None => Err("cannot identify the runtime filesystem".into()),
+    let fields: Vec<&str> = before.split_whitespace().collect();
+    Some(MountInfo {
+      target: PathBuf::from(fields.get(4)?.replace("\\040", " ")),
+      filesystem: after.split_whitespace().next()?.to_string(),
+      propagates: fields.iter().skip(6).any(|field| field.starts_with("shared:") || field.starts_with("master:")),
+    })
+  }).filter(|mount| canonical.starts_with(&mount.target)).max_by_key(|mount| mount.target.as_os_str().len());
+  mount.map(|mount| (canonical, mount)).ok_or_else(|| "cannot identify the runtime filesystem".into())
+}
+
+fn ensure_tmpfs(path: &Path) -> Result<(), String> {
+  match mount_info(path)? {
+    (_, mount) if mount.filesystem == "tmpfs" => Ok(()),
+    (canonical, mount) => Err(format!("{canonical:?} is on {} at {:?}, not tmpfs", mount.filesystem, mount.target)),
+  }
+}
+
+/// Docker's rslave bind carries later host mounts into the container only when
+/// the source mount is shared (or itself a slave).
+fn ensure_propagating(path: &Path) -> Result<(), String> {
+  match mount_info(path)? {
+    (_, mount) if mount.propagates => Ok(()),
+    (canonical, mount) => Err(format!("{canonical:?} is on a private mount at {:?}; archive mounts need shared propagation", mount.target)),
   }
 }
 
@@ -138,29 +428,33 @@ fn resource_root() -> PathBuf {
     .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."))
 }
 
-fn compose(project: &str, runtime: &Path, action: &str, args: &[&str]) -> Result<(), String> {
-  let root = resource_root();
-  let status = Command::new("docker")
-    .current_dir(root)
+fn compose_command(project: &str, runtime: &Path, overrides: &[PathBuf]) -> Result<Command, String> {
+  let metadata = runtime.metadata().map_err(|error| error.to_string())?;
+  let mut command = Command::new("docker");
+  command
+    .current_dir(resource_root())
     .env("SESSION_RUNTIME_DIR", runtime)
-    .env("SESSION_UID", runtime.metadata().map_err(|error| error.to_string())?.uid().to_string())
-    .env("SESSION_GID", runtime.metadata().map_err(|error| error.to_string())?.gid().to_string())
-    .args(["compose", "-p", project, "-f", "compose.yaml", action])
+    .env("SESSION_UID", metadata.uid().to_string())
+    .env("SESSION_GID", metadata.gid().to_string())
+    .args(["compose", "-p", project, "-f", "compose.yaml"]);
+  for file in overrides {
+    command.arg("-f").arg(file);
+  }
+  Ok(command)
+}
+
+fn compose(project: &str, runtime: &Path, overrides: &[PathBuf], action: &str, args: &[&str]) -> Result<(), String> {
+  let status = compose_command(project, runtime, overrides)?
+    .arg(action)
     .args(args)
     .status().map_err(|error| format!("start Docker Compose: {error}"))?;
   status.success().then_some(()).ok_or_else(|| format!("docker compose {action} failed"))
 }
 
-fn container_vnc_address(project: &str, runtime: &Path) -> Result<SocketAddr, String> {
-  let root = resource_root();
+fn container_vnc_address(project: &str, runtime: &Path, overrides: &[PathBuf]) -> Result<SocketAddr, String> {
   for _ in 0..30 {
-    let metadata = runtime.metadata().map_err(|error| error.to_string())?;
-    let output = Command::new("docker")
-      .current_dir(&root)
-      .env("SESSION_RUNTIME_DIR", runtime)
-      .env("SESSION_UID", metadata.uid().to_string())
-      .env("SESSION_GID", metadata.gid().to_string())
-      .args(["compose", "-p", project, "-f", "compose.yaml", "ps", "-q", "desktop"])
+    let output = compose_command(project, runtime, overrides)?
+      .args(["ps", "-q", "desktop"])
       .output()
       .map_err(|error| error.to_string())?;
     let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -174,12 +468,52 @@ fn container_vnc_address(project: &str, runtime: &Path) -> Result<SocketAddr, St
   Err("desktop container did not become available".into())
 }
 
-fn wait_for_vnc(address: SocketAddr) -> Result<(), String> {
-  for _ in 0..50 {
+fn wait_for_vnc(address: SocketAddr, progress: &Progress) -> Result<(), String> {
+  for _ in 0..300 {
+    if progress.stopping() { return Err("session cancelled".into()); }
     if std::net::TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_ok() { return Ok(()); }
     thread::sleep(Duration::from_millis(100));
   }
-  Err("desktop VNC server did not become ready".into())
+  Err("desktop VNC server did not become ready within 30 seconds".into())
+}
+
+const IMAGE: &str = "docker-vm-desktop:local";
+const SOURCE_LABEL: &str = "docker-vm.source";
+
+/// Fingerprint of everything the desktop Dockerfile copies. An image built
+/// from different sources (or by an older viewer) is rebuilt; a matching one
+/// starts with no build step at all.
+fn image_fingerprint() -> Result<String, String> {
+  use std::hash::{DefaultHasher, Hasher};
+  let directory = resource_root().join("images/desktop");
+  let mut files: Vec<PathBuf> = fs::read_dir(&directory).map_err(|error| format!("read {}: {error}", directory.display()))?
+    .filter_map(|entry| entry.ok().map(|entry| entry.path())).filter(|path| path.is_file()).collect();
+  files.sort();
+  let mut hasher = DefaultHasher::new();
+  for file in files {
+    hasher.write(file.file_name().unwrap_or_default().as_encoded_bytes());
+    hasher.write(&fs::read(&file).map_err(|error| format!("read {}: {error}", file.display()))?);
+  }
+  Ok(format!("{:016x}", hasher.finish()))
+}
+
+fn ensure_image(progress: &Arc<Progress>) -> Result<(), String> {
+  progress.stage("Checking desktop image…");
+  let fingerprint = image_fingerprint()?;
+  let label = Command::new("docker").args(["image", "inspect", "-f", &format!("{{{{index .Config.Labels \"{SOURCE_LABEL}\"}}}}"), IMAGE])
+    .stderr(Stdio::null()).output().map_err(|error| format!("run docker: {error}"))?;
+  let current = String::from_utf8_lossy(&label.stdout).trim().to_string();
+  if label.status.success() && current == fingerprint { return Ok(()); }
+  progress.stage(if label.status.success() {
+    "Updating the desktop image (sources changed)… this can take a few minutes."
+  } else {
+    "Building the desktop image for first use… this can take several minutes."
+  });
+  let mut build = Command::new("docker");
+  build.current_dir(resource_root())
+    .args(["build", "--progress=plain", "--label"]).arg(format!("{SOURCE_LABEL}={fingerprint}"))
+    .args(["-t", IMAGE, "-f", "images/desktop/Dockerfile", "."]);
+  progress.run(build, "desktop image build")
 }
 
 fn bridge(vnc: SocketAddr, capability: String) -> Result<(SocketAddr, watch::Sender<bool>), String> {
@@ -239,4 +573,25 @@ async fn proxy(stream: TcpStream, vnc: SocketAddr, capability: String, capabilit
     }
   };
   tokio::select! { _ = client_to_vnc => {}, _ = vnc_to_client => {} }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn escapes_values_for_compose() {
+    assert_eq!(compose_string(r#"/a "b" \c $HOME"#), r#""/a \"b\" \\c $$HOME""#);
+    let control = compose_string(&char::from(1u8).to_string());
+    assert!(control.len() == 8 && control.ends_with("u0001\""), "{control}");
+  }
+
+  #[test]
+  fn binds_mount_points_read_only_with_slave_propagation() {
+    let document = mount_override(&[(Path::new("/run/user/1000/docker-vm/p.mounts/0"), "/home/desktop/assets")]).unwrap();
+    assert_eq!(
+      document,
+      r#"{"services":{"desktop":{"volumes":[{"type":"bind","source":"/run/user/1000/docker-vm/p.mounts/0","target":"/home/desktop/assets","read_only":true,"bind":{"propagation":"rslave","create_host_path":false}}]}}}"#,
+    );
+  }
 }

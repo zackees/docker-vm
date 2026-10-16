@@ -42,13 +42,25 @@ profile are tmpfs mounts. The host bind mount holds only the generated password
 file in the viewer-verified `XDG_RUNTIME_DIR` tmpfs directory and is read-only in
 the container.
 
+Archive mounts are opt-in (`--mount type=zip`) and are the only other host binds.
+Each binds an empty directory beside the session directory read-only with
+`rslave` propagation; after `compose up`, the viewer mounts a FUSE view of the
+archive on that directory. Decryption happens in the viewer process on each
+read, and plaintext is never written to disk. The FUSE mount is read-only,
+`nodev`/`nosuid`, and has no `allow_other`/`allow_root`, so the kernel admits only
+the session UID/GID: container root, other container UIDs, and host root cannot
+read it, and Docker never has to access it. Passwords come from a 0600 file,
+standard input, or a dialog, are verified before the container starts, and are
+zeroed when dropped. Archive paths are sanitized: absolute and `..` entries and
+symlinks are not exposed.
+
 The native WebKitGTK shell loads only the local viewer UI and uses an
 off-the-record request context. Chromium inside the desktop container keeps its
 own renderer sandbox; Docker's default seccomp profile cannot be used because it
 blocks the namespace setup required by that sandbox. The container therefore
 uses `seccomp=unconfined`, while still running as an unprivileged user with all
-Linux capabilities dropped, a read-only root, and no host mounts or device
-access. Host journald/coredump capture remains a strict-preflight concern.
+Linux capabilities dropped, a read-only root, and no host mounts (other than
+the read-only session directory and opted-in archive views) or device access. Host journald/coredump capture remains a strict-preflight concern.
 
 Deletion at exit is prompt cleanup only—not the privacy control. Volatile mounts
 prevent the session data from being written in the first place.
