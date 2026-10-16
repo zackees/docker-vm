@@ -44,7 +44,9 @@ pub struct PreparedMount {
 pub struct SessionManager {
   root: PathBuf,
   project: String,
-  overrides: Vec<PathBuf>,
+  // Archive-mount and GPU compose overrides; the GPU one is dropped again if
+  // the container cannot start with the device.
+  overrides: Mutex<Vec<PathBuf>>,
   mounts_dir: PathBuf,
   mount_points: Vec<PathBuf>,
   archive_mounts: Mutex<Vec<BackgroundSession>>,
@@ -143,7 +145,7 @@ impl SessionManager {
       stopping: AtomicBool::new(false),
     });
     let manager = Arc::new(Self {
-      root, project, overrides, mounts_dir, mount_points,
+      root, project, overrides: Mutex::new(overrides), mounts_dir, mount_points,
       archive_mounts: Mutex::new(Vec::new()), progress, startup: Mutex::new(None), shutdown: Mutex::new(None),
     });
     let password = secret(24)?;
@@ -174,13 +176,18 @@ impl SessionManager {
         create_private_dir(directory)?;
       }
       let binds: Vec<(&Path, &str)> = self.mount_points.iter().map(PathBuf::as_path).zip(mounts.iter().map(|mount| mount.target.as_str())).collect();
-      write_secret(&self.overrides[0], mount_override(&binds)?.as_bytes())?;
+      write_secret(&self.overrides()[0], mount_override(&binds)?.as_bytes())?;
     }
     ensure_image(progress)?;
-    progress.stage("Starting desktop container…");
-    let mut up = compose_command(&self.project, &self.root, &self.overrides)?;
-    up.args(["up", "-d", "--no-build"]);
-    progress.run(up, "docker compose up")?;
+    progress.stage("Checking for GPU acceleration…");
+    match gpu_device() {
+      Ok(device) => self.up_with_gpu(&device)?,
+      Err(reason) => {
+        eprintln!("CPU rendering: {reason}");
+        progress.stage(&format!("Starting desktop container (CPU rendering: {reason})…"));
+        self.up()?;
+      }
+    }
     // Mount only once the container exists: its rslave binds receive the FUSE
     // mounts, so Docker (root) never needs access to them.
     let owner = self.root.metadata().map_err(|error| error.to_string())?;
@@ -189,12 +196,44 @@ impl SessionManager {
       self.archive_mounts.lock().map_err(|_| "archive mount lock unavailable")?.push(session);
     }
     progress.stage("Waiting for the desktop to accept connections…");
-    let vnc = container_vnc_address(&self.project, &self.root, &self.overrides)?;
+    let vnc = container_vnc_address(&self.project, &self.root, &self.overrides())?;
     wait_for_vnc(vnc, progress)?;
     let capability = secret(32)?;
     let (address, shutdown) = bridge(vnc, capability.clone())?;
     *self.shutdown.lock().map_err(|_| "shutdown lock unavailable")? = Some(shutdown);
     Ok(Connection { websocket_url: format!("ws://{address}"), capability, vnc_password: password })
+  }
+
+  fn overrides(&self) -> Vec<PathBuf> {
+    self.overrides.lock().map(|overrides| overrides.clone()).unwrap_or_default()
+  }
+
+  fn up(&self) -> Result<(), String> {
+    let mut up = compose_command(&self.project, &self.root, &self.overrides())?;
+    up.args(["up", "-d", "--no-build"]);
+    self.progress.run(up, "docker compose up")
+  }
+
+  /// Starts the container with the CDI GPU device. If Docker cannot provide
+  /// it after all, removes that container and starts the CPU-only session.
+  fn up_with_gpu(&self, device: &str) -> Result<(), String> {
+    let progress = &self.progress;
+    progress.stage(&format!("Starting desktop container (GPU rendering on {device})…"));
+    // Beside the session directory, so the container never sees it.
+    let file = self.root.with_extension("gpu.yaml");
+    write_secret(&file, gpu_override(device).as_bytes())?;
+    self.overrides.lock().map_err(|_| "override lock unavailable")?.push(file.clone());
+    match self.up() {
+      Err(error) if !progress.stopping() => {
+        eprintln!("GPU rendering unavailable ({error}); falling back to CPU");
+        let _ = compose(&self.project, &self.root, &self.overrides(), "down", &["--remove-orphans", "--timeout", "0"]);
+        self.overrides.lock().map_err(|_| "override lock unavailable")?.retain(|path| path != &file);
+        let _ = fs::remove_file(&file);
+        progress.stage(&format!("Starting desktop container (CPU rendering: {device} failed to start)…"));
+        self.up()
+      }
+      result => result,
+    }
   }
 
   pub fn status(&self) -> Status {
@@ -231,10 +270,10 @@ impl SessionManager {
     if let Some(handle) = handle && handle.thread().id() != thread::current().id() { let _ = handle.join(); }
     // RAM-only session: nothing to flush, so skip Docker's 10 s stop grace.
     if first {
-      let _ = compose(&self.project, &self.root, &self.overrides, "down", &["--remove-orphans", "--timeout", "0"]);
+      let _ = compose(&self.project, &self.root, &self.overrides(), "down", &["--remove-orphans", "--timeout", "0"]);
     }
     // Archives stay mounted until the container is gone.
-    release_archives(&self.archive_mounts, &self.mounts_dir, &self.mount_points, &self.overrides);
+    release_archives(&self.archive_mounts, &self.mounts_dir, &self.mount_points, &self.overrides());
     // Do not remove a non-tmpfs path. `start` only creates this after tmpfs
     // verification; removal is merely prompt release, not the privacy control.
     let _ = fs::remove_dir_all(&self.root);
@@ -332,6 +371,41 @@ fn mount_override(binds: &[(&Path, &str)]) -> Result<String, String> {
     ))
   }).collect::<Result<Vec<_>, _>>()?;
   Ok(format!(r#"{{"services":{{"desktop":{{"volumes":[{}]}}}}}}"#, volumes.join(",")))
+}
+
+/// The NVIDIA CDI device for GPU rendering, or why the session renders on the
+/// CPU. GPU mode is automatic: it needs KVM enabled (it is switched on only
+/// selectively on some hosts) and an NVIDIA GPU that Docker exposes via CDI.
+/// `DOCKER_VM_GPU=off` opts out.
+fn gpu_device() -> Result<String, String> {
+  if std::env::var_os("DOCKER_VM_GPU").is_some_and(|value| value == "off") {
+    return Err("disabled by DOCKER_VM_GPU=off".into());
+  }
+  fs::File::options().read(true).write(true).open("/dev/kvm")
+    .map_err(|error| format!("KVM is not enabled (/dev/kvm: {error})"))?;
+  let output = Command::new("docker").args(["info", "-f", "{{json .DiscoveredDevices}}"]).stderr(Stdio::null()).output()
+    .map_err(|error| format!("run docker info: {error}"))?;
+  pick_gpu(&String::from_utf8_lossy(&output.stdout)).ok_or_else(|| "no NVIDIA GPU is exposed to Docker".into())
+}
+
+/// Lowest-numbered `nvidia.com/gpu=N` in `docker info`'s DiscoveredDevices
+/// JSON; never `=all`, so a session holds one GPU.
+fn pick_gpu(devices: &str) -> Option<String> {
+  const PREFIX: &str = "\"nvidia.com/gpu=";
+  devices.match_indices(PREFIX)
+    .filter_map(|(start, _)| {
+      let rest = &devices[start + PREFIX.len()..];
+      let digits = &rest[..rest.find('"')?];
+      Some((digits.parse::<u32>().ok()?, digits))
+    })
+    .min()
+    .map(|(_, digits)| format!("nvidia.com/gpu={digits}"))
+}
+
+/// Compose override adding the CDI device and telling the session script to
+/// enable Chromium's GPU path.
+fn gpu_override(device: &str) -> String {
+  format!(r#"{{"services":{{"desktop":{{"devices":[{}],"environment":{{"DESKTOP_GPU":"nvidia"}}}}}}}}"#, compose_string(device))
 }
 
 fn compose_string(value: &str) -> String {
@@ -584,6 +658,23 @@ mod tests {
     assert_eq!(compose_string(r#"/a "b" \c $HOME"#), r#""/a \"b\" \\c $$HOME""#);
     let control = compose_string(&char::from(1u8).to_string());
     assert!(control.len() == 8 && control.ends_with("u0001\""), "{control}");
+  }
+
+  #[test]
+  fn picks_the_lowest_numbered_nvidia_gpu() {
+    let devices = r#"[{"Source":"cdi","ID":"nvidia.com/gpu=all"},{"Source":"cdi","ID":"nvidia.com/gpu=1"},{"Source":"cdi","ID":"nvidia.com/gpu=0"}]"#;
+    assert_eq!(pick_gpu(devices).as_deref(), Some("nvidia.com/gpu=0"));
+    assert_eq!(pick_gpu(r#"[{"Source":"cdi","ID":"nvidia.com/gpu=all"}]"#), None);
+    assert_eq!(pick_gpu("[]"), None);
+    assert_eq!(pick_gpu("null"), None);
+  }
+
+  #[test]
+  fn gpu_override_adds_the_cdi_device() {
+    assert_eq!(
+      gpu_override("nvidia.com/gpu=0"),
+      r#"{"services":{"desktop":{"devices":["nvidia.com/gpu=0"],"environment":{"DESKTOP_GPU":"nvidia"}}}}"#,
+    );
   }
 
   #[test]

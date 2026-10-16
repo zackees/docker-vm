@@ -34,8 +34,13 @@ enabled for this purpose.
 For a release candidate, collect sanitized evidence that:
 
 - `docker inspect` shows `ReadonlyRootfs=true`, `LogConfig.Type=none`, no
-  restart policy, no GPU/device/Docker socket/host-home mounts, and no published
-  VNC port.
+  restart policy, no Docker socket/host-home mounts, and no published VNC port;
+  devices are empty in CPU mode and exactly one `nvidia.com/gpu=N` CDI device
+  in GPU mode.
+- GPU mode engages automatically with `/dev/kvm` usable and an NVIDIA CDI
+  device present (`chrome://gpu` in the session reports hardware acceleration
+  on ANGLE/Vulkan), and `DOCKER_VM_GPU=off` or an unusable `/dev/kvm` falls
+  back to CPU rendering.
 - with a synthetic encrypted archive mounted, the target is read-only in the
   container, reads as UID 0 or any other UID fail with `Permission denied`, the
   host mount options show no `allow_other`, and the mount and its directory are
