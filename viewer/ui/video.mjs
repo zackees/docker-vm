@@ -223,6 +223,56 @@ function quietRfb(RFB, active) {
   return () => { messages.fbUpdateRequest = request; messages.enableContinuousUpdates = continuous; };
 }
 
+// Native presentation: the viewer process decodes and draws the stream on
+// the GPU in a layer over noVNC's canvas (no CPU copy per frame, which the
+// webview path cannot avoid). This only places that layer, quiets RFB while
+// it shows frames, and restores RFB if it stops. Returns false when native
+// presentation is unavailable, so the caller can use startVideo instead.
+export async function startNativeVideo(RFB, rfb, invoke, onStop = () => {}, onFrames = null) {
+  if (!(await invoke('native_video_start'))) return false;
+  let live = false;
+  let stopped = false;
+  let frames = 0;
+  const restore = quietRfb(RFB, () => live);
+  const place = () => {
+    const box = rfb._canvas.getBoundingClientRect();
+    invoke('native_video_place', { x: Math.round(box.left), y: Math.round(box.top),
+                                   width: Math.round(box.width), height: Math.round(box.height) });
+  };
+  const observer = new ResizeObserver(place);
+  observer.observe(rfb._canvas);
+  window.addEventListener('resize', place);
+  place();
+  const stop = reason => {
+    if (stopped) return;
+    stopped = true;
+    live = false;
+    clearInterval(timer);
+    observer.disconnect();
+    window.removeEventListener('resize', place);
+    restore();
+    RFB.messages.fbUpdateRequest(rfb._sock, false, 0, 0, rfb._fbWidth, rfb._fbHeight);
+    rfb._updateContinuousUpdates();
+    onStop(reason);
+  };
+  const timer = setInterval(async () => {
+    const state = await invoke('native_video_state').catch(() => ({ state: 'failed', reason: 'state unavailable' }));
+    if (state.state === 'live') {
+      onFrames?.(state.frames - frames);
+      frames = state.frames;
+      if (!live) {
+        live = true;
+        place();
+        rfb._updateContinuousUpdates();
+      }
+    } else if (state.state === 'failed' || state.state === 'off') {
+      stop(state.reason ?? state.state);
+    }
+  }, 250);
+  rfb.addEventListener('disconnect', () => stop('session ended'), { once: true });
+  return true;
+}
+
 // Returns false when hardware video is not offered or not decodable here.
 export async function startVideo(RFB, rfb, { video_url: url, video_capability: capability }, onStop = () => {}, onFrame = null) {
   if (!url || !capability || typeof VideoDecoder === 'undefined') return false;

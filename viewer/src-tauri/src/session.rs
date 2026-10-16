@@ -59,6 +59,8 @@ pub struct SessionManager {
   shutdown: Mutex<Vec<watch::Sender<bool>>>,
   // Set when the container was started with the NVENC video service.
   video: AtomicBool,
+  // The container's NVENC stream, for the viewer's native presenter.
+  video_address: Mutex<Option<SocketAddr>>,
   // RFB bytes forwarded to the viewer; read only by `DOCKER_VM_STATS` reports.
   bridged_bytes: Arc<AtomicU64>,
 }
@@ -154,7 +156,7 @@ impl SessionManager {
     });
     let manager = Arc::new(Self {
       root, project, overrides: Mutex::new(overrides), mounts_dir, mount_points,
-      archive_mounts: Mutex::new(Vec::new()), progress, startup: Mutex::new(None), shutdown: Mutex::new(Vec::new()), video: AtomicBool::new(false),
+      archive_mounts: Mutex::new(Vec::new()), progress, startup: Mutex::new(None), shutdown: Mutex::new(Vec::new()), video: AtomicBool::new(false), video_address: Mutex::new(None),
       bridged_bytes: Arc::new(AtomicU64::new(0)),
     });
     let password = secret(24)?;
@@ -227,10 +229,16 @@ impl SessionManager {
       eprintln!("hardware video unavailable; using VNC frames");
       return Ok(None);
     }
+    *self.video_address.lock().map_err(|_| "video lock unavailable")? = Some(address);
     let capability = secret(32)?;
     let (bridged, shutdown) = bridge(address, capability.clone(), Arc::clone(&self.bridged_bytes))?;
     self.shutdown.lock().map_err(|_| "shutdown lock unavailable")?.push(shutdown);
     Ok(Some((bridged, capability)))
+  }
+
+  /// Where the container serves its NVENC stream, once it is up.
+  pub fn video_address(&self) -> Option<SocketAddr> {
+    self.video_address.lock().ok().and_then(|address| *address)
   }
 
   fn overrides(&self) -> Vec<PathBuf> {
@@ -564,7 +572,11 @@ const CONTAINER_LIBS: &str = "/usr/lib/x86_64-linux-gnu";
 /// falls back to its X session by itself if the compositor cannot start.
 fn wayland_display() -> Option<WaylandDisplay> {
   if std::env::var_os("DOCKER_VM_WAYLAND").is_some_and(|value| value == "off") { return None; }
-  let allocator = ALLOCATOR_CANDIDATES.iter().find_map(|path| Path::new(path).canonicalize().ok())?;
+  // DOCKER_VM_GBM_ALLOCATOR names it on hosts with another library layout.
+  let allocator = match std::env::var_os("DOCKER_VM_GBM_ALLOCATOR") {
+    Some(path) => Path::new(&path).canonicalize().ok()?,
+    None => ALLOCATOR_CANDIDATES.iter().find_map(|path| Path::new(path).canonicalize().ok())?,
+  };
   Some(WaylandDisplay { allocator })
 }
 

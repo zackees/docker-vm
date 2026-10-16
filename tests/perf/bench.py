@@ -121,6 +121,7 @@ class RunResult:
     container_cpu: list[CpuShare] = field(default_factory=list)
     viewer_cpu: list[CpuShare] = field(default_factory=list)
     stats: list[StatsReport] = field(default_factory=list)
+    viewer_gpu_clients: list[str] = field(default_factory=list)
     error: str = ""
 
     def stats_average(self) -> StatsReport | None:
@@ -180,6 +181,13 @@ def cpu_shares(before: list[ProcessSample], after: list[ProcessSample], seconds:
         if percent >= 1:
             per_label.append(CpuShare(label, percent))
     return sorted(per_label, key=lambda share: -share.percent)
+
+
+def gpu_clients(pids: list[int]) -> list[str]:
+    """Which of these processes hold an NVIDIA GPU context (nvidia-smi)."""
+    listed = {int(pid) for pid in re.findall(r"^\|\s+\d+\s+\S+\s+\S+\s+(\d+)\s", run("nvidia-smi"), re.MULTILINE)}
+    return sorted({label_for(Path(f"/proc/{pid}/cmdline").read_text().replace("\0", " "))
+                   for pid in pids if pid in listed and Path(f"/proc/{pid}").exists()})
 
 
 def container_pids(container: str) -> list[int]:
@@ -257,6 +265,7 @@ def measure(variant: Variant, viewer_bin: Path, scale: str, seconds: float, logs
         elapsed = time.monotonic() - start
         result.container_cpu = cpu_shares(before_in, sample(inside), elapsed)
         result.viewer_cpu = cpu_shares(before_out, sample(outside), elapsed)
+        result.viewer_gpu_clients = gpu_clients(outside)
         result.stats = stats_after(log, offset)
         service_log = docker_exec(container, "cat", "/run/user/1000/video-stream.log")
         (logs / f"video-stream-{variant.label}.log").write_text(service_log)
@@ -285,6 +294,7 @@ def report(result: RunResult) -> None:
     print(f"  framebuffer {result.framebuffer} on {result.display_server}, page fps {result.page_fps}")
     for title, shares in (("container", result.container_cpu), ("host viewer", result.viewer_cpu)):
         print(f"  -- {title}: " + ", ".join(f"{s.label} {s.percent:.0f}%" for s in shares))
+    print(f"  -- viewer GPU clients: {', '.join(result.viewer_gpu_clients) or 'none (CPU only)'}")
     average = result.stats_average()
     if average is None:
         print("  no viewer stats reports")

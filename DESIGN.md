@@ -91,6 +91,8 @@ In GPU mode the viewer therefore starts a Wayland desktop instead
   stalls a live screencast, so `wayland-session` watches the output's actual
   mode and bumps a generation file on any change; `video-stream` then renews
   the screencast.
+- **Viewer**: decodes (NVDEC) and draws the stream natively in a GTK overlay
+  on the noVNC canvas; see `docs/GPU-PIPELINE.md` for the measured pipeline.
 - **Fallback**: if sway or wayvnc cannot start, `wayland-session` exits 75 and
   `ephemeral-session` starts the Xtigervnc session described above.
 

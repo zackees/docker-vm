@@ -3,7 +3,7 @@
 // downloads, navigation, or popup surface.
 import RFB from './novnc/core/rfb.js';
 import { physicalRFB } from './physical-rfb.mjs';
-import { nv12Pixel, startVideo } from './video.mjs';
+import { nv12Pixel, startNativeVideo, startVideo } from './video.mjs';
 import * as Log from './novnc/core/util/logging.js';
 
 Log.initLogging('error');
@@ -53,7 +53,10 @@ function countFrames(rfb) {
   };
   setInterval(() => {
     const now = performance.now();
-    window.__TAURI__.core.invoke('report_stats', { frames, decodeMs, seconds: (now - since) / 1000 });
+    // With native presentation every presented frame is new content (the
+    // compositor only sends damage), so those count as content frames.
+    const presented = window.__nativeFrames?.() ?? 0;
+    window.__TAURI__.core.invoke('report_stats', { frames: frames + presented, decodeMs, seconds: (now - since) / 1000 });
     const video = startVideo.counts;
     if (video) {
       const message = `stats video/2s: received ${video.received} decoded ${video.decoded} presented ${video.presented} ` +
@@ -105,15 +108,23 @@ try {
   rfb.resizeSession = true;
   rfb.viewOnly = false;
   let stamps = null;
+  // Frames the native video layer presented (DOCKER_VM_STATS reporting).
+  let nativeFrames = 0;
+  window.__nativeFrames = () => { const count = nativeFrames; nativeFrames = 0; return count; };
   // Register before any await, or a fast connect fires with no listener.
   const videoEvent = message => window.__TAURI__.core.invoke('video_event', { message }).catch(() => {});
   rfb.addEventListener('connect', async () => {
     document.documentElement.classList.add('connected');
-    // NVENC video when offered and decodable; RFB frames otherwise.
-    const started = await startVideo(RFB, rfb, session, reason => videoEvent(`stopped, using VNC frames: ${reason}`),
-                                     planes => stamps?.(nv12Pixel(planes, 16, 16)))
+    // NVENC video, presented natively on the GPU when possible, else through
+    // WebCodecs; RFB frames otherwise.
+    const invoke = (command, args) => window.__TAURI__.core.invoke(command, args);
+    const stopped = reason => videoEvent(`stopped, using VNC frames: ${reason}`);
+    const native = await startNativeVideo(RFB, rfb, invoke, stopped, count => { nativeFrames += count; })
+      .catch(error => { videoEvent(`native presentation failed to start: ${error.message}`); return false; });
+    const started = native || await startVideo(RFB, rfb, session, stopped, planes => stamps?.(nv12Pixel(planes, 16, 16)))
       .catch(error => { videoEvent(`failed to start: ${error.message}`); return false; });
-    videoEvent(started ? 'hardware H.264 stream started' : 'not offered or not decodable; using VNC frames');
+    videoEvent(native ? 'hardware H.264 stream presented natively'
+      : started ? 'hardware H.264 stream started (WebCodecs)' : 'not offered or not decodable; using VNC frames');
   }, { once: true });
   // The GPU X server cannot honour RFB resizes on its output-less screen; it
   // resizes through the host (display-size) and names its desktop so.

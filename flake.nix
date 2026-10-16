@@ -64,7 +64,10 @@
         buildInputs = [
           pkgs.gtk3 pkgs.webkitgtk_4_1 pkgs.glib pkgs.libsoup_3
           pkgs.gst_all_1.gstreamer pkgs.gst_all_1.gst-plugins-base
-          pkgs.gst_all_1.gst-plugins-good
+          # gtkglsink: the viewer presents the NVENC stream natively on the
+          # GPU in a GTK layer (WebKitGTK's WebCodecs->WebGL path copies every
+          # frame through the CPU).
+          (pkgs.gst_all_1.gst-plugins-good.override { gtkSupport = true; })
           # WebCodecs H.264 for the NVENC video transport: nvcodec (NVDEC) in
           # -bad, avdec as the software fallback.
           pkgs.gst_all_1.gst-plugins-bad pkgs.gst_all_1.gst-libav
@@ -128,12 +131,16 @@
           cp -r images $out/share/docker-vm/images
           cp compose.yaml $out/share/docker-vm/
           cp viewer/src-tauri/icons/icon.png $out/share/pixmaps/docker-vm.png
+          # The viewer must be a GPU client: it presents the NVENC stream with
+          # nvh264dec -> GL -> gtkglsink. Forcing LIBGL_ALWAYS_SOFTWARE /
+          # WEBKIT_DISABLE_COMPOSITING_MODE made every viewer GL context Mesa
+          # llvmpipe: 22.6 fps shown at 2560x1600 vs 58.4 (= the page's fps)
+          # with hardware GL, and nothing crashed without them
+          # (docs/GPU-PIPELINE.md).
           makeWrapper $out/libexec/docker-vm-viewer $out/bin/docker-vm \
             --run 'ulimit -c 0' \
             --set DOCKER_VM_RESOURCE_DIR $out/share/docker-vm \
             --set GDK_BACKEND x11 \
-            --set LIBGL_ALWAYS_SOFTWARE 1 \
-            --set WEBKIT_DISABLE_COMPOSITING_MODE 1 \
             --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.docker pkgs.docker-compose pkgs.zenity ]}
           runHook postInstall
         '';

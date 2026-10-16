@@ -34,7 +34,8 @@ from dataclasses import dataclass
 import gi
 
 gi.require_version("Gst", "1.0")
-from gi.repository import GLib, Gst  # noqa: E402
+gi.require_version("GstVideo", "1.0")
+from gi.repository import GLib, Gst, GstVideo  # noqa: E402
 
 HEADER = struct.Struct(">IBQ")
 KEYFRAME = 1
@@ -253,7 +254,7 @@ class Capture:
 class Stream:
     """One capture/encode pipeline feeding one connected client."""
 
-    def __init__(self, description: str, client: socket.socket) -> None:
+    def __init__(self, description: str, client: socket.socket | None) -> None:
         self.client = client
         self.client_gone = threading.Event()
         self.pipeline_failed = threading.Event()
@@ -265,7 +266,19 @@ class Stream:
         bus.add_signal_watch()
         bus.connect("message::error", self.on_error)
 
+    def attach(self, client: socket.socket) -> None:
+        """Hands the running pipeline to a new client, starting it with an IDR,
+        instead of rebuilding the capture (a fresh PipeWire connection right
+        after the last one sometimes fails to negotiate)."""
+        self.client = client
+        self.client_gone.clear()
+        pad = self.pipeline.get_by_name("sink").get_static_pad("sink")
+        pad.send_event(GstVideo.video_event_new_upstream_force_key_unit(Gst.CLOCK_TIME_NONE, True, 0))
+
     def on_sample(self, sink: Gst.Element) -> Gst.FlowReturn:
+        if self.client is None:
+            sink.emit("pull-sample")  # no viewer: keep capturing, drop frames
+            return Gst.FlowReturn.OK
         buffer = sink.emit("pull-sample").get_buffer()
         ok, info = buffer.map(Gst.MapFlags.READ)
         if not ok:
@@ -355,10 +368,30 @@ class Server:
     def accept(self, listener: socket.socket, _condition: GLib.IOCondition) -> bool:
         client, _ = listener.accept()
         client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        self.drop_client()  # One viewer: the newest connection wins.
-        self.client = client
-        self.restart()
+        # The viewer probes the port (connect, close) before connecting for
+        # real; only a connection still open after a moment gets the stream.
+        GLib.timeout_add(300, self.adopt, client)
         return True
+
+    def adopt(self, client: socket.socket) -> bool:
+        try:
+            closed = client.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT) == b""
+        except BlockingIOError:
+            closed = False
+        except OSError:
+            closed = True
+        if closed:
+            client.close()
+            return False
+        if self.client:
+            self.client.close()  # one viewer: the newest connection wins
+        self.client = client
+        stream = self.stream
+        if stream and not stream.pipeline_failed.is_set() and stream.frames > 0:
+            stream.attach(client)
+        else:
+            self.restart()
+        return False
 
     def watchdog(self) -> bool:
         if self.capture.portal and self.output_changed():
@@ -373,10 +406,16 @@ class Server:
                 self.schedule_restart(100)
             return True
         stream = self.stream
-        if stream and stream.frames == 0 and time.monotonic() - stream.started_at > FIRST_FRAME_TIMEOUT_S:
+        if (stream and stream.client is not None and stream.frames == 0
+                and time.monotonic() - stream.started_at > FIRST_FRAME_TIMEOUT_S):
             stream.pipeline_failed.set()
         if stream and stream.client_gone.is_set():
-            self.drop_client()
+            # Viewer gone: keep the capture running for the next one.
+            stream.client = None
+            stream.client_gone.clear()
+            if self.client:
+                self.client.close()
+                self.client = None
         elif stream and stream.pipeline_failed.is_set() and not self.pending_restart:
             if stream.frames >= HEALTHY_FRAMES:
                 self.failures = 0  # it ran; this is a new problem (e.g. a resize)
@@ -386,8 +425,10 @@ class Server:
                 # A layout the portal cannot allocate fails before any frame:
                 # try the next one; only when none works use system memory.
                 if self.capture.dmabuf_ok and stream.frames < HEALTHY_FRAMES:
-                    if self.capture.proven:
-                        pass  # keep the layout that worked; just renew
+                    if self.capture.proven or stream.frames > 0:
+                        # It produced frames, so the layout works; this was a
+                        # resize or renegotiation: renew, keep the layout.
+                        self.capture.proven = self.capture.proven or stream.frames > 0
                     elif self.capture.next_modifier():
                         log(f"DMA-BUF layout failed; trying {self.capture.modifier}")
                     else:
