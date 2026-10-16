@@ -13,7 +13,7 @@ animation; host load 40-100 from other work). Re-measure with
 | # | Stage | Process | API / device | Memory | Copy? |
 |---|---|---|---|---|---|
 | 1 | Page raster + compositing | Chromium (container, `--ozone-platform=wayland`) | ANGLE/GL on NVIDIA EGL | GPU | no |
-| 2 | Desktop compositing | sway, headless wlroots backend | GLES 3.2, NVIDIA EGL device | GPU | no |
+| 2 | Desktop compositing | labwc + Xfce panel/desktop, headless wlroots backend | GLES 3.2, NVIDIA EGL device | GPU | no |
 | 3 | Screen capture | xdg-desktop-portal-wlr → PipeWire | wlr-screencopy, DMA-BUF `XR24:0x0300000000e080xx` | GPU | no |
 | 4 | Import | video-stream: `pipewiresrc ! glupload` | EGLImage from DMA-BUF | GPU | no |
 | 5 | Colour convert | `glcolorconvert` → NV12 | GL | GPU | no |
@@ -26,7 +26,7 @@ Input never uses this path: keyboard and pointer go over RFB to wayvnc (ARD
 auth), which also serves full RFB frames whenever video is not live.
 
 Container side, measured: stages 1-6 sustain **54-56 fps at 2560x1600**,
-including a mid-stream resize; sway ~40-60%, the encoder process ~20%, Chromium
+including a mid-stream resize; the compositor ~40-60%, the encoder process ~20%, Chromium
 GPU process ~12% of one core.
 
 ## Requirements the CDI spec does not cover
@@ -50,6 +50,8 @@ GPU process ~12% of one core.
 | Screencast silent after a resize | output mode change stalls the portal stream without an error | `wayland-session` watches the output mode → generation file → `video-stream` renews |
 | Second portal session refused (code 2) | request/session tokens reused across sessions | process-wide token counter |
 | WebCodecs `EncodingError: Decode error` | WebKitGTK decodes AVC (length-prefixed + `avcC`) only, never Annex-B | viewer builds `avcC`, length-prefixes NAL units |
+| No mouse input reaches the desktop while video is live | `gtkglsink`'s GL area has its own event window; overlay pass-through alone does not cover it | empty input shape on the overlay window and its children |
+| Desktop gets half the pixels at 2x zoom on a HiDPI host | viewer forced onto XWayland (`GDK_BACKEND=x11`) | GTK's native backend; on Wayland the viewer sets `GST_GL_API=opengl3` (otherwise `gtkglsink` context creation fails) |
 | GStreamer GTK widget never shows a frame | `gtkglsink` cannot preroll until its widget is realized | widget realized up front, transparent until the first frame |
 
 ## Viewer side
@@ -71,7 +73,7 @@ llvmpipe. Same container, same 2560x1600 animation at ~58 fps:
 | software (old wrapper) | native gtkglsink | 22.6 | none |
 | hardware (current wrapper) | native gtkglsink | **58.4** (= page fps), RFB 0, viewer ~22% CPU | WebKitWebProcess, docker-vm-viewer |
 
-Nothing crashed or went blank without the software flags; `GDK_BACKEND=x11`
-stays. Check a host with `nvidia-smi` while the viewer runs: both processes
+Nothing crashed or went blank without the software flags. With labwc and the
+native Wayland viewer: 53.0 fps shown of 58.0 rendered at 2560x1600. Check a host with `nvidia-smi` while the viewer runs: both processes
 should be listed. The viewer log line `native video: first frame presented`
 shows the native path is live.
