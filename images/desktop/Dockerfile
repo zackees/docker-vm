@@ -16,6 +16,8 @@ RUN apt-get update \
       tigervnc-tools xauth xfce4 xfce4-terminal python3-gi gir1.2-gtk-3.0 x11-xserver-utils \
       gdb x11-utils \
       libegl1 libgles2 libgl1 libvulkan1 \
+      gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 gstreamer1.0-plugins-base \
+      gstreamer1.0-plugins-bad gstreamer1.0-x \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --create-home --uid 1000 --shell /bin/bash desktop \
  && install -d -o desktop -g desktop -m 0700 /home/desktop
@@ -25,6 +27,7 @@ COPY --chmod=0755 images/desktop/ephemeral-session /usr/local/bin/ephemeral-sess
 COPY --chmod=0755 images/desktop/crash-watch /usr/local/bin/crash-watch
 COPY images/desktop/browser-backtrace.gdb /usr/local/share/browser-backtrace.gdb
 COPY --chmod=0755 images/desktop/display-scale /usr/local/bin/display-scale
+COPY --chmod=0755 images/desktop/video-stream /usr/local/bin/video-stream
 COPY images/desktop/display-scale.desktop /usr/share/applications/display-scale.desktop
 # GPU mode only: the NVIDIA CDI spec injects the driver libraries and device
 # nodes but not these loader registrations, so glvnd/Vulkan would never pick

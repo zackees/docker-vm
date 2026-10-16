@@ -47,6 +47,12 @@ if [[ ${DESKTOP_GPU:-} == nvidia ]]; then
 else
   export CHROMIUM_GPU_FLAGS="--disable-gpu"
 fi
+# Hardware video transport (viewer sets DESKTOP_VIDEO=nvenc only in GPU mode).
+# video-stream exits by itself if NVENC cannot open a session; the viewer then
+# keeps using RFB frames.
+if [[ ${DESKTOP_VIDEO:-} == nvenc ]]; then
+  video-stream 2>"$XDG_RUNTIME_DIR/video-stream.log" &
+fi
 dbus-run-session -- sh -c '
   startxfce4 &
   display-scale &

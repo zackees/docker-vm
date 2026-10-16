@@ -3,6 +3,7 @@
 // downloads, navigation, or popup surface.
 import RFB from './novnc/core/rfb.js';
 import { physicalRFB } from './physical-rfb.mjs';
+import { startVideo } from './video.mjs';
 import * as Log from './novnc/core/util/logging.js';
 
 Log.initLogging('error');
@@ -70,7 +71,8 @@ try {
   await ready();
   stage.textContent = 'Connecting to the desktop…';
   log.textContent = '';
-  const { websocket_url, capability, vnc_password } = await connection();
+  const session = await connection();
+  const { websocket_url, capability, vnc_password } = session;
   // The capability is a WebSocket subprotocol, never a URL fragment/query,
   // command-line argument, environment variable, or persisted preference.
   const PhysicalRFB = physicalRFB(RFB, window, scale => {
@@ -93,7 +95,14 @@ try {
   if (tuning.quality !== null) rfb.qualityLevel = tuning.quality;
   if (tuning.compression !== null) rfb.compressionLevel = tuning.compression;
   if (await window.__TAURI__.core.invoke('stats_enabled')) countFrames(rfb);
-  rfb.addEventListener('connect', () => document.documentElement.classList.add('connected'));
+  const videoEvent = message => window.__TAURI__.core.invoke('video_event', { message }).catch(() => {});
+  rfb.addEventListener('connect', async () => {
+    document.documentElement.classList.add('connected');
+    // NVENC video when offered and decodable; RFB frames otherwise.
+    const started = await startVideo(RFB, rfb, session, reason => videoEvent(`stopped, using VNC frames: ${reason}`))
+      .catch(error => { videoEvent(`failed to start: ${error.message}`); return false; });
+    videoEvent(started ? 'hardware H.264 stream started' : 'not offered or not decodable; using VNC frames');
+  }, { once: true });
   rfb.addEventListener('disconnect', event => {
     document.documentElement.classList.remove('connected');
     document.documentElement.classList.add('ended');
