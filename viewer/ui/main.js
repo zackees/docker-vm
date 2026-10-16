@@ -118,6 +118,7 @@ try {
     // NVENC video, presented natively on the GPU when possible, else through
     // WebCodecs; RFB frames otherwise.
     const invoke = (command, args) => window.__TAURI__.core.invoke(command, args);
+    invoke('native_audio_start').catch(() => {});
     const stopped = reason => videoEvent(`stopped, using VNC frames: ${reason}`);
     const native = await startNativeVideo(RFB, rfb, invoke, stopped, count => { nativeFrames += count; })
       .catch(error => { videoEvent(`native presentation failed to start: ${error.message}`); return false; });
@@ -130,6 +131,9 @@ try {
   // resizes through the host (display-size) and names its desktop so.
   // (wayvnc resizes its headless output on RFB requests itself.)
   rfb.addEventListener('desktopname', event => {
+    // The Wayland desktop draws no cursor (it would lag a full video round
+    // trip behind the hand); the host's own cursor stands in for it.
+    document.documentElement.classList.toggle('local-cursor', event.detail.name === 'WayVNC');
     if (event.detail.name === 'docker-vm GPU display') {
       rfb.hostResize = size => window.__TAURI__.core.invoke('set_display_size', { width: size.w, height: size.h })
         .catch(() => {});

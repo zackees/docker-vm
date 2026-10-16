@@ -6,6 +6,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod mounts;
+mod native_audio;
 mod native_video;
 mod session;
 mod zipfs;
@@ -43,13 +44,16 @@ fn main() {
   stop_on_signal(Arc::clone(&manager));
   let video = Arc::new(native_video::NativeVideo::default());
   let video_at_exit = Arc::clone(&video);
+  let audio = Arc::new(native_audio::NativeAudio::default());
+  let audio_at_exit = Arc::clone(&audio);
 
   tauri::Builder::default()
     .runtime(tauri_runtime_wry::Wry::default())
     .manage(manager)
     .manage(Arc::clone(&video))
+    .manage(audio)
     .invoke_handler(tauri::generate_handler![status, connection, set_display_scale, set_display_size, stats_enabled, report_stats, rfb_tuning, video_event,
-      native_video_start, native_video_state, native_video_place])
+      native_video_start, native_video_state, native_video_place, native_audio_start])
     .setup(move |app| {
       let window = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
         .title("Private desktop canvas")
@@ -69,6 +73,7 @@ fn main() {
     .run(move |_, event| {
       if matches!(event, RunEvent::Exit) {
         video_at_exit.stop();
+        audio_at_exit.stop();
         managed.stop();
       }
     });
@@ -151,6 +156,12 @@ fn connection(manager: tauri::State<'_, Arc<SessionManager>>) -> Result<Connecti
 #[tauri::command]
 fn native_video_start(manager: tauri::State<'_, Arc<SessionManager>>, video: tauri::State<'_, Arc<native_video::NativeVideo>>) -> bool {
   video.start(manager.video_address())
+}
+
+/// Starts playing the desktop's audio, if the container offers it.
+#[tauri::command]
+fn native_audio_start(manager: tauri::State<'_, Arc<SessionManager>>, audio: tauri::State<'_, Arc<native_audio::NativeAudio>>) {
+  audio.start(manager.audio_address());
 }
 
 #[tauri::command]

@@ -61,6 +61,8 @@ pub struct SessionManager {
   video: AtomicBool,
   // The container's NVENC stream, for the viewer's native presenter.
   video_address: Mutex<Option<SocketAddr>>,
+  // The container's audio stream (Wayland desktop only; absent otherwise).
+  audio_address: Mutex<Option<SocketAddr>>,
   // RFB bytes forwarded to the viewer; read only by `DOCKER_VM_STATS` reports.
   bridged_bytes: Arc<AtomicU64>,
 }
@@ -156,7 +158,7 @@ impl SessionManager {
     });
     let manager = Arc::new(Self {
       root, project, overrides: Mutex::new(overrides), mounts_dir, mount_points,
-      archive_mounts: Mutex::new(Vec::new()), progress, startup: Mutex::new(None), shutdown: Mutex::new(Vec::new()), video: AtomicBool::new(false), video_address: Mutex::new(None),
+      archive_mounts: Mutex::new(Vec::new()), progress, startup: Mutex::new(None), shutdown: Mutex::new(Vec::new()), video: AtomicBool::new(false), video_address: Mutex::new(None), audio_address: Mutex::new(None),
       bridged_bytes: Arc::new(AtomicU64::new(0)),
     });
     let password = secret(24)?;
@@ -209,6 +211,7 @@ impl SessionManager {
     progress.stage("Waiting for the desktop to accept connections…");
     let vnc = container_vnc_address(&self.project, &self.root, &self.overrides())?;
     wait_for_vnc(vnc, progress)?;
+    *self.audio_address.lock().map_err(|_| "audio lock unavailable")? = Some(SocketAddr::new(vnc.ip(), AUDIO_PORT));
     let capability = secret(32)?;
     let (address, shutdown) = bridge(vnc, capability.clone(), Arc::clone(&self.bridged_bytes))?;
     self.shutdown.lock().map_err(|_| "shutdown lock unavailable")?.push(shutdown);
@@ -235,6 +238,11 @@ impl SessionManager {
     let (bridged, shutdown) = bridge(address, capability.clone(), Arc::clone(&self.bridged_bytes))?;
     self.shutdown.lock().map_err(|_| "shutdown lock unavailable")?.push(shutdown);
     Ok(Some((bridged, capability)))
+  }
+
+  /// Where the container serves its audio, once the session is up.
+  pub fn audio_address(&self) -> Option<SocketAddr> {
+    self.audio_address.lock().ok().and_then(|address| *address)
   }
 
   /// Where the container serves its NVENC stream, once it is up.
@@ -469,6 +477,7 @@ fn pick_gpu(devices: &str) -> Option<String> {
 }
 
 const VIDEO_PORT: u16 = 5901;
+const AUDIO_PORT: u16 = 5902;
 
 /// What the container needs for NVENC on the chosen GPU.
 #[derive(Debug, PartialEq)]

@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""Desktop audio for the private desktop viewer.
+
+Creates a null sink named "desktop" on the session's PipeWire (through its
+PulseAudio server) and makes it the default, so applications play into it.
+Listens on TCP 5902 (container network only; never published) for one client
+at a time and, while it is connected, sends what the sink plays as Opus
+(48 kHz stereo, 10 ms frames):
+
+    u32 payload length (big-endian) | Opus packet
+
+Output only: there is no microphone path into the container.
+"""
+from __future__ import annotations
+
+import socket
+import struct
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+
+import gi
+
+gi.require_version("Gst", "1.0")
+from gi.repository import Gst  # noqa: E402
+
+PORT = 5902
+SINK = "desktop"
+LENGTH = struct.Struct(">I")
+
+
+@dataclass(frozen=True)
+class Config:
+    port: int = PORT
+    bitrate: int = 128_000
+    frame_ms: int = 10
+
+
+def log(message: str) -> None:
+    print(f"audio-stream: {message}", file=sys.stderr, flush=True)
+
+
+def create_sink(deadline_s: float = 20.0) -> bool:
+    """Waits for the PulseAudio server (pipewire-pulse), then adds the sink."""
+    deadline = time.monotonic() + deadline_s
+    while time.monotonic() < deadline:
+        if subprocess.run(["pactl", "info"], capture_output=True).returncode == 0:
+            break
+        time.sleep(0.25)
+    else:
+        log("no PulseAudio server; no audio")
+        return False
+    sinks = subprocess.run(["pactl", "list", "short", "sinks"], capture_output=True, text=True).stdout
+    if f"\t{SINK}\t" not in sinks:
+        subprocess.run(["pactl", "load-module", "module-null-sink", f"sink_name={SINK}",
+                        "sink_properties=device.description=Desktop"], check=True, capture_output=True)
+    subprocess.run(["pactl", "set-default-sink", SINK], check=True, capture_output=True)
+    return True
+
+
+@dataclass
+class Stream:
+    """One client's capture -> Opus pipeline."""
+    client: socket.socket
+    pipeline: Gst.Pipeline | None = None
+    alive: bool = True
+
+    def start(self, config: Config) -> None:
+        self.pipeline = Gst.parse_launch(
+            f"pulsesrc device={SINK}.monitor buffer-time=20000 latency-time={config.frame_ms * 1000} ! "
+            "audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 ! "
+            f"opusenc bitrate={config.bitrate} frame-size={config.frame_ms} audio-type=generic ! "
+            "appsink name=out emit-signals=true sync=false max-buffers=50 drop=true")
+        self.pipeline.get_by_name("out").connect("new-sample", self.on_sample)
+        self.pipeline.set_state(Gst.State.PLAYING)
+
+    def on_sample(self, sink) -> Gst.FlowReturn:
+        sample = sink.emit("pull-sample")
+        buffer = sample.get_buffer()
+        ok, info = buffer.map(Gst.MapFlags.READ)
+        if not ok:
+            return Gst.FlowReturn.OK
+        try:
+            self.client.sendall(LENGTH.pack(info.size) + bytes(info.data))
+        except OSError:
+            self.alive = False
+            return Gst.FlowReturn.EOS
+        finally:
+            buffer.unmap(info)
+        return Gst.FlowReturn.OK
+
+    def stop(self) -> None:
+        if self.pipeline is not None:
+            self.pipeline.set_state(Gst.State.NULL)
+        self.client.close()
+
+
+def serve(config: Config) -> None:
+    listener = socket.create_server(("0.0.0.0", config.port))
+    log(f"listening on {config.port}")
+    while True:
+        client, _ = listener.accept()
+        client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        stream = Stream(client)
+        stream.start(config)
+        bus = stream.pipeline.get_bus()
+        while stream.alive:
+            message = bus.timed_pop_filtered(200 * Gst.MSECOND, Gst.MessageType.ERROR | Gst.MessageType.EOS)
+            if message is not None:
+                if message.type == Gst.MessageType.ERROR:
+                    log(f"pipeline error: {message.parse_error()[0].message}")
+                break
+        stream.stop()
+
+
+def main() -> int:
+    Gst.init(None)
+    if not create_sink():
+        return 0
+    serve(Config())
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
