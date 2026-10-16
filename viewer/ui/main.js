@@ -7,8 +7,24 @@ import * as Log from './novnc/core/util/logging.js';
 
 Log.initLogging('error');
 
+window.__viewerLoaded = true;
 const status = document.querySelector('#status');
+const stage = document.querySelector('#stage');
+const log = document.querySelector('#log');
 const target = document.querySelector('#screen');
+
+// Docker work runs behind the window; show each step and the latest build or
+// compose output until the session is ready or has failed.
+async function ready() {
+  for (;;) {
+    const current = await window.__TAURI__.core.invoke('status');
+    if (current.state === 'ready') return;
+    stage.textContent = current.state === 'failed' ? `Unable to start the private session: ${current.error}` : current.stage;
+    log.textContent = current.log.join('\n');
+    if (current.state === 'failed') throw new Error(current.error);
+    await new Promise(resolve => setTimeout(resolve, 250));
+  }
+}
 
 async function connection() {
   // Returns an in-memory, one-use bridge capability.
@@ -22,12 +38,15 @@ try {
     scale: Math.min(4, Math.max(0.5, Number.isFinite(scale) ? scale : 1)),
   });
   await passScale(window.devicePixelRatio);
+  await ready();
+  stage.textContent = 'Connecting to the desktop…';
+  log.textContent = '';
   const { websocket_url, capability, vnc_password } = await connection();
   // The capability is a WebSocket subprotocol, never a URL fragment/query,
   // command-line argument, environment variable, or persisted preference.
   const PhysicalRFB = physicalRFB(RFB, window, scale => {
     passScale(scale).catch(() => {
-      status.textContent = 'Unable to update desktop DPI.';
+      stage.textContent = 'Unable to update desktop DPI.';
       status.style.display = 'block';
     });
   });
@@ -44,8 +63,10 @@ try {
   rfb.addEventListener('connect', () => document.documentElement.classList.add('connected'));
   rfb.addEventListener('disconnect', event => {
     document.documentElement.classList.remove('connected');
-    status.textContent = event.detail.clean ? 'Session ended.' : 'Session lost; refusing reconnect.';
+    document.documentElement.classList.add('ended');
+    stage.textContent = event.detail.clean ? 'Session ended.' : 'Session lost; refusing reconnect.';
   });
-} catch (_) {
-  status.textContent = 'Unable to start the private session.';
+} catch (error) {
+  document.documentElement.classList.add('failed');
+  if (!stage.textContent.startsWith('Unable')) stage.textContent = `Unable to start the private session: ${error?.message ?? error}`;
 }

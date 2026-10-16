@@ -2,6 +2,9 @@
   description = "Private Docker desktop, built from source through Soldr";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/c5c4a43b0e8056328ec4529f735cabdb8f1942bb";
+  # The viewer embeds the noVNC submodule; without it the window loads no RFB
+  # client and never leaves "Starting…".
+  inputs.self.submodules = true;
 
   outputs = { self, nixpkgs }:
     let
@@ -57,6 +60,10 @@
         }) ];
         buildPhase = ''
           runHook preBuild
+          test -f viewer/ui/novnc/core/rfb.js || {
+            echo "viewer/ui/novnc is empty: fetch this flake with submodules" >&2
+            exit 1
+          }
           export DOCKER_VM_SOURCE_ROOT="$PWD"
           mkdir -p viewer/src-tauri/.cargo
           cp ${cargoVendor}/.cargo/config.toml viewer/src-tauri/.cargo/config.toml

@@ -9,7 +9,11 @@
   </head>
   <body>
     <main id="screen" aria-label="Private remote desktop canvas"></main>
-    <p id="status" role="status">Starting an ephemeral desktop session…</p>
+    <section id="status" role="status" aria-live="polite">
+      <p id="stage">Starting an ephemeral desktop session…</p>
+      <pre id="log"></pre>
+    </section>
+    <script src="boot.js"></script>
     <script type="module" src="main.js"></script>
   </body>
 </html>

@@ -103,6 +103,36 @@ loader can fail silently. The viewer creates one fresh Docker Compose project,
 an in-memory VNC password, and an authenticated loopback bridge. Closing it
 removes only that project.
 
+### Read-only archive mounts
+
+A ZIP archive, including a password-protected one, can be exposed inside the
+desktop as a read-only folder. `--mount` uses `docker run --mount` syntax and
+may be repeated:
+
+```bash
+./launch --mount type=zip,source=./assets.zip,target=/home/desktop/assets
+./launch --password-stdin --mount type=zip,src=secrets.zip,dst=/mnt/secrets < password.txt
+```
+
+- Mounts are always read-only; `rw` and `readonly=false` are rejected. Targets
+  must be inside `/home/desktop`, `/mnt` or `/media`.
+- Passwords are never accepted as arguments. Use `password-file=FILE` (mode
+  0600), `--password-stdin`, or the dialog shown when an archive has encrypted
+  entries. The password is checked before any container starts.
+- Nothing is extracted. The viewer serves the archive itself over FUSE and
+  decrypts each read on demand (AES-128/192/256 and legacy ZipCrypto; stored,
+  deflate, deflate64, bzip2 and LZMA entries). Reading backwards within a
+  compressed or encrypted entry restarts its decoding. Symlinks and entries with
+  absolute or `..` paths are hidden.
+
+Each archive is mounted onto an empty directory under
+`$XDG_RUNTIME_DIR/docker-vm/<project>.mounts/` *after* the container starts.
+That directory is bound read-only with `rslave` propagation, so the mount
+appears at the target without Docker (root) ever touching it. No `allow_other`
+or `user_allow_other` is needed: only the session user and group can read the
+files, not root or any other UID in the container. Files appear a moment after
+the desktop starts; closing the viewer removes the container, then unmounts.
+
 ### Resolution and HiDPI
 
 The viewer automatically requests a remote framebuffer sized in physical pixels
