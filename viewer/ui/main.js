@@ -93,7 +93,9 @@ try {
     });
   });
   const rfb = new PhysicalRFB(target, websocket_url, {
-    credentials: { password: vnc_password },
+    // wayvnc (Wayland GPU desktop) authenticates with ARD, which needs a
+    // username; Xtigervnc's VNC auth uses only the password.
+    credentials: { username: 'desktop', password: vnc_password },
     shared: false,
     wsProtocols: ['binary', capability],
   });
@@ -113,7 +115,9 @@ try {
       .catch(error => { videoEvent(`failed to start: ${error.message}`); return false; });
     videoEvent(started ? 'hardware H.264 stream started' : 'not offered or not decodable; using VNC frames');
   }, { once: true });
-  // The GPU X server names its desktop so; it resizes through the host.
+  // The GPU X server cannot honour RFB resizes on its output-less screen; it
+  // resizes through the host (display-size) and names its desktop so.
+  // (wayvnc resizes its headless output on RFB requests itself.)
   rfb.addEventListener('desktopname', event => {
     if (event.detail.name === 'docker-vm GPU display') {
       rfb.hostResize = size => window.__TAURI__.core.invoke('set_display_size', { width: size.w, height: size.h })

@@ -18,6 +18,18 @@ vncpasswd -f <"$VNC_PASSWORD_FILE" >"$password_file"
 
 geometry=${DESKTOP_GEOMETRY:-1280x800}
 
+# Wayland GPU desktop (viewer sets DESKTOP_DISPLAY=wayland in GPU mode): sway
+# on the GPU, wayvnc, PipeWire capture. It exits 75 when it cannot start; the
+# X session below is the fallback.
+if [[ ${DESKTOP_DISPLAY:-} == wayland ]]; then
+  set +e
+  DESKTOP_GEOMETRY=$geometry dbus-run-session -- wayland-session
+  status=$?
+  set -e
+  [[ $status == 75 ]] || exit "$status"
+  echo "Wayland GPU desktop unavailable; using the X session" >&2
+fi
+
 wait_for_display() {
   local tries=$1
   for _ in $(seq 1 "$tries"); do
