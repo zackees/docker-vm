@@ -51,3 +51,28 @@ remained loaded and both Docker CDI spec directories disappeared. Docker could
 no longer resolve `nvidia.com/gpu=0`. Do not repair driver/CDI state from this
 project; regenerate the host's CDI configuration after completing the host driver
 update, then rerun preflight, pairing, and all live gates.
+
+## VNC baseline (2026-10-16)
+
+`tests/perf/bench.sh` with the viewer's `DOCKER_VM_STATS=1` counters: a
+full-screen canvas animation in a GPU-mode session (RTX 3060, ANGLE/Vulkan
+raster, software compositing), host load average ~45-50. "Content fps" is the
+number of distinct page frames the viewer actually painted (frame-stamp block),
+not RFB updates.
+
+| Framebuffer | Setting | Page fps (container) | Content fps (viewer) | Xvnc CPU | Chromium GPU proc | Viewer WebKit |
+|---|---|---|---|---|---|---|
+| 1280x800 | defaults (q6, c2) | 58.8 | 26.5 | 57% | 35% | 45% |
+| 2560x1600 | defaults (q6, c2) | 24.0 | 12.6 | 90% | 75% | 85% |
+| 2560x1600 | quality 4 | 31.5 | 9.4 | 79% | 70% | 65% |
+| 2560x1600 | quality 2 | 22.3 | 10.5 | 79% | 71% | 68% |
+| 2560x1600 | quality 8 | 29.0 | 9.3 | 80% | 71% | 60% |
+| 2560x1600 | compression 6 | 31.0 | 10.3 | 79% | 71% | 63% |
+| 2560x1600 | Xvnc CompareFB=0 | 28.0 | 10.1 | 78% | 67% | 67% |
+
+At HiDPI, no RFB quality/compression or Xvnc setting moves delivered frames
+meaningfully: Xvnc encoding, Chromium's software compositing (needed to reach
+Xvnc at all) and noVNC's JavaScript decoding each consume most of a core. Only
+fewer pixels helps (about 2x at 1280x800). Compression level 1 at 2560x1600
+stalled delivery entirely in two runs. Defaults are unchanged; the next step is
+a hardware-encoded video transport, measured with the same harness.
