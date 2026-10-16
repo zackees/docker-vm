@@ -116,6 +116,7 @@ class StatsReport:
 class RunResult:
     variant: Variant
     framebuffer: str = "?"
+    display_server: str = "?"
     page_fps: str = "?"
     container_cpu: list[CpuShare] = field(default_factory=list)
     viewer_cpu: list[CpuShare] = field(default_factory=list)
@@ -181,16 +182,23 @@ def host_pids(viewer: int) -> list[int]:
     return [viewer, *map(int, children)]
 
 
-def wait_for_session(log: Path, deadline_s: float) -> str:
-    deadline = time.monotonic() + deadline_s
+def wait_for_session(log: Path, build_s: float, run_s: float) -> str:
+    """Two phases: the image build/pull (container creation starts only after
+    it) gets its own long limit; the session itself must start within run_s."""
+    deadline = time.monotonic() + build_s
+    started_run = None
     while time.monotonic() < deadline:
         text = log.read_text(errors="replace") if log.exists() else ""
         if "private session failed" in text:
             raise RuntimeError("session failed to start")
+        if started_run is None and "desktop-1 Creating" in text:
+            started_run = time.monotonic()
+            deadline = started_run + run_s
         if "desktop-1 Started" in text and (match := CONTAINER_NAME.search(text)):
             return match.group(0)
         time.sleep(1)
-    raise TimeoutError(f"no session within {deadline_s:.0f}s")
+    phase = "image build" if started_run is None else "session start"
+    raise TimeoutError(f"{phase} did not finish in time")
 
 
 def stats_after(log: Path, offset: int) -> list[StatsReport]:
@@ -209,13 +217,15 @@ def measure(variant: Variant, viewer_bin: Path, scale: str, seconds: float, logs
         # The wrappers exec, so this process becomes the viewer itself.
         viewer = subprocess.Popen([str(viewer_bin)], cwd=Path.home(), env=env, stdout=out, stderr=subprocess.STDOUT)
     try:
-        container = wait_for_session(log, 300)
+        container = wait_for_session(log, build_s=3600, run_s=120)
         time.sleep(12)
         dims = re.search(r"dimensions:\s+(\S+)", docker_exec(container, "xdpyinfo"))
         result.framebuffer = dims.group(1) if dims else "?"
         browser = next((line for line in docker_exec(container, "ps", "-eo", "args").splitlines()
                         if line.startswith("/usr/lib/chromium/chromium --user-data-dir=/home")), "")
         flags = GPU_FLAG.findall(browser)
+        processes = docker_exec(container, "ps", "-eo", "comm")
+        result.display_server = "Xorg (GPU)" if "Xorg" in processes else "Xtigervnc"
         for setting in variant.xvnc_settings:
             docker_exec(container, "vncconfig", "-display", ":0", "-set", setting)
         subprocess.Popen(["docker", "exec", "-e", "DISPLAY=:0", container, "/usr/lib/chromium/chromium",
@@ -231,6 +241,8 @@ def measure(variant: Variant, viewer_bin: Path, scale: str, seconds: float, logs
         result.container_cpu = cpu_shares(before_in, sample(inside), elapsed)
         result.viewer_cpu = cpu_shares(before_out, sample(outside), elapsed)
         result.stats = stats_after(log, offset)
+        service_log = docker_exec(container, "cat", "/run/user/1000/video-stream.log")
+        (logs / f"video-stream-{variant.label}.log").write_text(service_log)
         fps = re.search(r"fps [\d.]+", docker_exec(container, "xwininfo", "-root", "-tree"))
         result.page_fps = fps.group(0).removeprefix("fps ") if fps else "?"
     except (RuntimeError, TimeoutError) as error:
@@ -251,7 +263,7 @@ def report(result: RunResult) -> None:
     if result.error:
         print(f"  error: {result.error}")
         return
-    print(f"  framebuffer {result.framebuffer}, page fps {result.page_fps}")
+    print(f"  framebuffer {result.framebuffer} on {result.display_server}, page fps {result.page_fps}")
     for title, shares in (("container", result.container_cpu), ("host viewer", result.viewer_cpu)):
         print(f"  -- {title}: " + ", ".join(f"{s.label} {s.percent:.0f}%" for s in shares))
     average = result.stats_average()
@@ -272,6 +284,7 @@ def main() -> int:
     parser.add_argument("--logs", type=Path, default=None)
     args = parser.parse_args()
     logs = args.logs or Path(tempfile.mkdtemp(prefix="docker-vm-bench."))
+    logs.mkdir(parents=True, exist_ok=True)
     print(f"logs: {logs}")
     for spec in args.specs:
         report(measure(Variant.parse(spec), args.viewer_bin, args.scale, args.seconds, logs))

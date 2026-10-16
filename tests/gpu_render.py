@@ -79,7 +79,9 @@ def nvidia_device() -> str | None:
 
 
 def gpu_flags() -> str:
-    match = re.search(r'^\s*export CHROMIUM_GPU_FLAGS="(--ignore-gpu-blocklist[^"]*)"$',
+    # The Xtigervnc GPU path (software compositing); the GPU X server path is
+    # covered by its own check.
+    match = re.search(r'^\s*export CHROMIUM_GPU_FLAGS="(--ignore-gpu-blocklist[^"]*--disable-gpu-compositing[^"]*)"$',
                       SESSION_SCRIPT.read_text(), re.MULTILINE)
     if not match:
         sys.exit("gpu-render: cannot read GPU-mode flags from ephemeral-session")

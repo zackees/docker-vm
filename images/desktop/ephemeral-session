@@ -16,21 +16,97 @@ password_file="$XDG_RUNTIME_DIR/vnc-password"
 umask 077
 vncpasswd -f <"$VNC_PASSWORD_FILE" >"$password_file"
 
+geometry=${DESKTOP_GEOMETRY:-1280x800}
+
+wait_for_display() {
+  local tries=$1
+  for _ in $(seq 1 "$tries"); do
+    [[ -S /tmp/.X11-unix/X0 ]] && kill -0 "$vnc_pid" 2>/dev/null && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
 # Cut text is disabled in both directions. TigerVNC provides no file-transfer
 # extension here; the bridge only forwards RFB bytes.
 # Docker publishes no port. Do not add -localhost here: the host-owned bridge
 # connects to the container's private bridge-network address.
-Xtigervnc :0 -geometry "${DESKTOP_GEOMETRY:-1280x800}" -depth 24 \
-  -rfbport 5900 -SecurityTypes VncAuth -PasswordFile "$password_file" \
-  -AcceptCutText=0 -SendCutText=0 >"$XDG_RUNTIME_DIR/xvnc.log" 2>&1 &
-vnc_pid=$!
-trap 'kill "$vnc_pid" 2>/dev/null || true; wait "$vnc_pid" 2>/dev/null || true' EXIT INT TERM
+start_xvnc() {
+  Xtigervnc :0 -geometry "$geometry" -depth 24 \
+    -rfbport 5900 -SecurityTypes VncAuth -PasswordFile "$password_file" \
+    -AcceptCutText=0 -SendCutText=0 >"$XDG_RUNTIME_DIR/xvnc.log" 2>&1 &
+  vnc_pid=$!
+}
 
-for _ in $(seq 1 50); do
-  [[ -S /tmp/.X11-unix/X0 ]] && break
-  sleep 0.1
-done
-[[ -S /tmp/.X11-unix/X0 ]] || { echo "Xvnc did not start" >&2; exit 1; }
+# GPU display server: headless Xorg on the host's NVIDIA X driver (mounted
+# read-only by the viewer) with TigerVNC's Xorg module, so Chromium composites
+# on the GPU. Same RFB endpoint and options as Xtigervnc. No monitor: the
+# screen is virtual and RandR resizes it to the viewer's window.
+start_xorg() {
+  local config="$XDG_RUNTIME_DIR/xorg.conf"
+  cat >"$config" <<XORG
+Section "ServerFlags"
+    Option "AutoAddDevices" "false"
+    Option "AutoAddGPU" "false"
+    Option "AllowEmptyInput" "true"
+    Option "DontVTSwitch" "true"
+EndSection
+Section "Files"
+    ModulePath "/opt/nvidia-xorg"
+    ModulePath "/usr/lib/xorg/modules"
+EndSection
+Section "Module"
+    Load "vnc"
+    Load "glx"
+EndSection
+Section "Device"
+    Identifier "gpu"
+    Driver "nvidia"
+    BusID "$DESKTOP_XORG_BUSID"
+    Option "AllowEmptyInitialConfiguration" "true"
+    Option "UseDisplayDevice" "None"
+EndSection
+Section "Screen"
+    Identifier "screen"
+    Device "gpu"
+    DefaultDepth 24
+    Option "rfbport" "5900"
+    # No RandR outputs on a headless NVIDIA screen: client resizes would
+    # collapse it to 8x8. display-size applies the viewer's size instead; the
+    # desktop name tells the viewer to use that path.
+    Option "AcceptSetDesktopSize" "0"
+    Option "desktop" "docker-vm GPU display"
+    Option "SecurityTypes" "VncAuth"
+    Option "PasswordFile" "$password_file"
+    Option "AcceptCutText" "0"
+    Option "SendCutText" "0"
+    SubSection "Display"
+        Depth 24
+        Virtual ${geometry%x*} ${geometry#*x}
+    EndSubSection
+EndSection
+XORG
+  /usr/lib/xorg/Xorg :0 -config "$config" -noreset -nolisten tcp -keeptty -novtswitch \
+    -logfile "$XDG_RUNTIME_DIR/Xorg.log" >/dev/null 2>&1 &
+  vnc_pid=$!
+}
+
+display_server=xvnc
+if [[ ${DESKTOP_XORG:-} == nvidia && -n ${DESKTOP_XORG_BUSID:-} ]]; then
+  start_xorg
+  if wait_for_display 100; then
+    display_server=xorg
+  else
+    echo "GPU display server did not start; using Xtigervnc (see Xorg.log)" >&2
+    kill "$vnc_pid" 2>/dev/null || true
+    wait "$vnc_pid" 2>/dev/null || true
+    rm -f /tmp/.X11-unix/X0 /tmp/.X0-lock
+  fi
+fi
+[[ $display_server == xorg ]] || start_xvnc
+[[ $display_server == xorg ]] && DISPLAY=:0 display-size 2>"$XDG_RUNTIME_DIR/display-size.log" &
+trap 'kill "$vnc_pid" 2>/dev/null || true; wait "$vnc_pid" 2>/dev/null || true' EXIT INT TERM
+wait_for_display 50 || { echo "X display did not start" >&2; exit 1; }
 
 export DISPLAY=:0
 display-scale --prepare
@@ -41,7 +117,11 @@ display-scale --prepare
 # software, which hands finished frames to X. tests/gpu_render.py checks the
 # actual pixels. Without a GPU the CPU path is unchanged: software rendering
 # with the GPU process off.
-if [[ ${DESKTOP_GPU:-} == nvidia ]]; then
+if [[ $display_server == xorg ]]; then
+  # GPU X server: Chromium composites on the GPU like on a local desktop.
+  unset LIBGL_ALWAYS_SOFTWARE
+  export CHROMIUM_GPU_FLAGS="--ignore-gpu-blocklist"
+elif [[ ${DESKTOP_GPU:-} == nvidia ]]; then
   unset LIBGL_ALWAYS_SOFTWARE
   export CHROMIUM_GPU_FLAGS="--ignore-gpu-blocklist --use-angle=vulkan --enable-features=Vulkan,DefaultANGLEVulkan,VulkanFromANGLE --disable-gpu-compositing"
 else

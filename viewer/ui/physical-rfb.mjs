@@ -40,7 +40,22 @@ export function physicalRFB(RFB, environment = window, densityChanged = () => {}
       }, { once: true });
     }
 
+    // The GPU X server ignores RFB SetDesktopSize (no RandR outputs); the
+    // viewer hands the size to the host, which resizes the screen directly.
+    set hostResize(callback) {
+      this._hostResize = callback;
+      this._requestRemoteResize();
+    }
+
     _requestRemoteResize() {
+      if (this._hostResize) {
+        const size = physicalSize(this._screenSize(), environment.devicePixelRatio);
+        if (!size || (size.w === this._fbWidth && size.h === this._fbHeight) || !this._resizeSession ||
+            this._viewOnly || this._rfbConnectionState !== 'connected') return;
+        clearTimeout(this._resizeTimeout);
+        this._resizeTimeout = setTimeout(() => this._hostResize(size), 100);
+        return;
+      }
       if (!this._resizeSession || this._viewOnly || !this._supportsSetDesktopSize ||
           this._rfbConnectionState !== 'connected' || this._pendingRemoteResize) return;
       const size = physicalSize(this._screenSize(), environment.devicePixelRatio);

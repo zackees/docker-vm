@@ -251,7 +251,11 @@ impl SessionManager {
     // Beside the session directory, so the container never sees it.
     let file = self.root.with_extension("gpu.yaml");
     let video = video_devices(device);
-    write_secret(&file, gpu_override(device, video.as_ref()).as_bytes())?;
+    let xorg = xorg_display(device);
+    if let Some(xorg) = &xorg {
+      progress.stage(&format!("Starting desktop container (GPU display server on {})…", xorg.bus_id));
+    }
+    write_secret(&file, gpu_override(device, video.as_ref(), xorg.as_ref()).as_bytes())?;
     self.video.store(video.is_some(), Ordering::Release);
     self.overrides.lock().map_err(|_| "override lock unavailable")?.push(file.clone());
     match self.up() {
@@ -281,6 +285,20 @@ impl SessionManager {
   }
 
   fn live(&self) -> bool { !self.progress.stopping() }
+
+  /// The GPU X server's framebuffer size (it cannot honour RFB resizes); the
+  /// container's display-size service applies it. Bounds match the viewer's
+  /// physical-size cap.
+  pub fn set_display_size(&self, width: u32, height: u32) -> Result<(), String> {
+    if !(32..=8192).contains(&width) || !(32..=8192).contains(&height) || u64::from(width) * u64::from(height) > 3840 * 2160 {
+      return Err("display size out of range".into());
+    }
+    let _status = self.progress.status.lock().map_err(|_| "session lock unavailable")?;
+    if !self.live() { return Err("session ended".into()); }
+    let temporary = self.root.join("display-size.next");
+    fs::write(&temporary, format!("{width}x{height}")).map_err(|_| "cannot write display size")?;
+    fs::rename(temporary, self.root.join("display-size")).map_err(|_| "cannot publish display size".into())
+  }
 
   pub fn set_display_scale(&self, scale: f64) -> Result<(), String> {
     if !scale.is_finite() || !(0.5..=4.0).contains(&scale) {
@@ -469,18 +487,84 @@ fn other_gpu_nodes(names: impl Iterator<Item = String>, chosen: u32) -> Vec<Stri
   nodes
 }
 
+/// The host's NVIDIA X driver for a GPU-backed X server in the container.
+/// Xvnc has no GPU, so Chromium there must composite in software; headless
+/// Xorg on the NVIDIA driver (with TigerVNC's Xorg module) composites on the
+/// GPU. The host's own modules always match its kernel driver.
+#[derive(Debug, PartialEq)]
+struct XorgDisplay {
+  driver: PathBuf,
+  glx: PathBuf,
+  /// X BusID of the chosen GPU, e.g. `PCI:6:0:0` (decimal).
+  bus_id: String,
+}
+
+const XORG_MODULE_DIRS: [&str; 4] = [
+  "/run/current-system/sw/lib/xorg/modules", // NixOS
+  "/usr/lib/xorg/modules",                    // Debian, Ubuntu, Arch
+  "/usr/lib64/xorg/modules",                  // Fedora, openSUSE
+  "/usr/lib/x86_64-linux-gnu/nvidia/xorg",    // Debian's nvidia packages
+];
+
+/// Opt-in (`DOCKER_VM_XORG=on`) until frames can leave the GPU without a
+/// framebuffer readback: on a headless NVIDIA screen, VNC scraping and
+/// ximagesrc both read the framebuffer back and fall far below Xtigervnc.
+fn xorg_display(device: &str) -> Option<XorgDisplay> {
+  if std::env::var_os("DOCKER_VM_XORG").is_none_or(|value| value != "on") { return None; }
+  let minor: u32 = device.strip_prefix("nvidia.com/gpu=")?.parse().ok()?;
+  let (driver, glx) = XORG_MODULE_DIRS.iter().find_map(|dir| {
+    let dir = Path::new(dir);
+    let driver = [dir.join("drivers/nvidia_drv.so"), dir.join("nvidia_drv.so")].into_iter().find_map(|path| path.canonicalize().ok())?;
+    let glx = [dir.join("extensions/libglxserver_nvidia.so"), dir.join("libglxserver_nvidia.so")].into_iter().find_map(|path| path.canonicalize().ok())?;
+    Some((driver, glx))
+  })?;
+  let bus_id = fs::read_dir("/proc/driver/nvidia/gpus").ok()?.filter_map(|entry| entry.ok()).find_map(|entry| {
+    let information = fs::read_to_string(entry.path().join("information")).ok()?;
+    (gpu_minor(&information)? == minor).then(|| x_bus_id(&entry.file_name().to_string_lossy())).flatten()
+  })?;
+  Some(XorgDisplay { driver, glx, bus_id })
+}
+
+fn gpu_minor(information: &str) -> Option<u32> {
+  information.lines().find_map(|line| line.strip_prefix("Device Minor:")?.trim().parse().ok())
+}
+
+/// `0000:06:00.0` (hex PCI address) to X's decimal `PCI:6:0:0`.
+fn x_bus_id(address: &str) -> Option<String> {
+  let (_domain, rest) = address.split_once(':')?;
+  let (bus, rest) = rest.split_once(':')?;
+  let (slot, function) = rest.split_once('.')?;
+  let hex = |value: &str| u32::from_str_radix(value, 16).ok();
+  Some(format!("PCI:{}:{}:{}", hex(bus)?, hex(slot)?, hex(function)?))
+}
+
+const XORG_MODULES: &str = "/opt/nvidia-xorg";
+
 /// Compose override adding the CDI device and telling the session script to
-/// enable Chromium's GPU path, plus the NVENC video service when possible.
-fn gpu_override(device: &str, video: Option<&VideoDevices>) -> String {
+/// enable Chromium's GPU path, plus the NVENC video service and the GPU X
+/// server when possible.
+fn gpu_override(device: &str, video: Option<&VideoDevices>, xorg: Option<&XorgDisplay>) -> String {
   let mut devices = vec![compose_string(device)];
+  let mut volumes = Vec::new();
   let mut environment = vec![r#""DESKTOP_GPU":"nvidia""#.to_string()];
+  if let Some(xorg) = xorg {
+    environment.push(r#""DESKTOP_XORG":"nvidia""#.into());
+    environment.push(format!(r#""DESKTOP_XORG_BUSID":{}"#, compose_string(&xorg.bus_id)));
+    for (source, target) in [(&xorg.driver, "drivers/nvidia_drv.so"), (&xorg.glx, "extensions/libglxserver_nvidia.so")] {
+      volumes.push(format!(
+        r#"{{"type":"bind","source":{},"target":"{XORG_MODULES}/{target}","read_only":true,"bind":{{"create_host_path":false}}}}"#,
+        compose_string(&source.to_string_lossy()),
+      ));
+    }
+  }
   if let Some(video) = video {
     devices.extend(video.other_nodes.iter().map(|node| compose_string(node)));
     environment.push(r#""DESKTOP_VIDEO":"nvenc""#.into());
     environment.push(r#""CUDA_DEVICE_ORDER":"PCI_BUS_ID""#.into());
     environment.push(format!(r#""DESKTOP_VIDEO_CUDA_DEVICE":"{}""#, video.cuda_index));
   }
-  format!(r#"{{"services":{{"desktop":{{"devices":[{}],"environment":{{{}}}}}}}}}"#, devices.join(","), environment.join(","))
+  let volumes = if volumes.is_empty() { String::new() } else { format!(r#","volumes":[{}]"#, volumes.join(",")) };
+  format!(r#"{{"services":{{"desktop":{{"devices":[{}],"environment":{{{}}}{volumes}}}}}}}"#, devices.join(","), environment.join(","))
 }
 
 fn compose_string(value: &str) -> String {
@@ -627,33 +711,60 @@ fn wait_for_vnc(address: SocketAddr, progress: &Progress) -> Result<(), String> 
 }
 
 const IMAGE: &str = "docker-vm-desktop:local";
+/// Prebuilt images, published by CI for each source fingerprint.
+const PREBUILT: &str = "ghcr.io/zackees/docker-vm-desktop";
 const SOURCE_LABEL: &str = "docker-vm.source";
 
-/// Fingerprint of everything the desktop Dockerfile copies. An image built
-/// from different sources (or by an older viewer) is rebuilt; a matching one
-/// starts with no build step at all.
+/// Fingerprint of everything the desktop Dockerfile copies: SHA-256 over the
+/// files directly in `images/desktop`, byte-sorted by name, each fed as
+/// name, NUL, contents, NUL; first 16 hex digits. `scripts/image-fingerprint`
+/// computes the same value for CI's image tags. A local image with another
+/// fingerprint is replaced; a matching one starts with no build step at all.
 fn image_fingerprint() -> Result<String, String> {
-  use std::hash::{DefaultHasher, Hasher};
-  let directory = resource_root().join("images/desktop");
-  let mut files: Vec<PathBuf> = fs::read_dir(&directory).map_err(|error| format!("read {}: {error}", directory.display()))?
+  fingerprint_dir(&resource_root().join("images/desktop"))
+}
+
+fn fingerprint_dir(directory: &Path) -> Result<String, String> {
+  use sha2::{Digest, Sha256};
+  let mut files: Vec<PathBuf> = fs::read_dir(directory).map_err(|error| format!("read {}: {error}", directory.display()))?
     .filter_map(|entry| entry.ok().map(|entry| entry.path())).filter(|path| path.is_file()).collect();
-  files.sort();
-  let mut hasher = DefaultHasher::new();
+  files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+  let mut digest = Sha256::new();
   for file in files {
-    hasher.write(file.file_name().unwrap_or_default().as_encoded_bytes());
-    hasher.write(&fs::read(&file).map_err(|error| format!("read {}: {error}", file.display()))?);
+    digest.update(file.file_name().unwrap_or_default().as_encoded_bytes());
+    digest.update([0]);
+    digest.update(fs::read(&file).map_err(|error| format!("read {}: {error}", file.display()))?);
+    digest.update([0]);
   }
-  Ok(format!("{:016x}", hasher.finish()))
+  Ok(digest.finalize().iter().take(8).map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn image_source(image: &str) -> Option<String> {
+  let output = Command::new("docker").args(["image", "inspect", "-f", &format!("{{{{index .Config.Labels \"{SOURCE_LABEL}\"}}}}"), image])
+    .stderr(Stdio::null()).output().ok()?;
+  output.status.success().then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn ensure_image(progress: &Arc<Progress>) -> Result<(), String> {
   progress.stage("Checking desktop image…");
   let fingerprint = image_fingerprint()?;
-  let label = Command::new("docker").args(["image", "inspect", "-f", &format!("{{{{index .Config.Labels \"{SOURCE_LABEL}\"}}}}"), IMAGE])
-    .stderr(Stdio::null()).output().map_err(|error| format!("run docker: {error}"))?;
-  let current = String::from_utf8_lossy(&label.stdout).trim().to_string();
-  if label.status.success() && current == fingerprint { return Ok(()); }
-  progress.stage(if label.status.success() {
+  let current = image_source(IMAGE);
+  if current.as_deref() == Some(fingerprint.as_str()) { return Ok(()); }
+  // A prebuilt image for exactly these sources downloads in a fraction of
+  // the time a local build takes; anything else falls through to building.
+  if std::env::var_os("DOCKER_VM_PREBUILT").is_none_or(|value| value != "off") {
+    let prebuilt = format!("{PREBUILT}:{fingerprint}");
+    progress.stage("Downloading the prebuilt desktop image…");
+    let mut pull = Command::new("docker");
+    pull.args(["pull", &prebuilt]);
+    if progress.run(pull, "prebuilt image download").is_ok() && image_source(&prebuilt).as_deref() == Some(fingerprint.as_str()) {
+      let tagged = Command::new("docker").args(["tag", &prebuilt, IMAGE]).status().map_err(|error| format!("run docker: {error}"))?;
+      if tagged.success() { return Ok(()); }
+    }
+    if progress.stopping() { return Err("session cancelled".into()); }
+    eprintln!("no prebuilt desktop image {prebuilt}; building locally");
+  }
+  progress.stage(if current.is_some() {
     "Updating the desktop image (sources changed)… this can take a few minutes."
   } else {
     "Building the desktop image for first use… this can take several minutes."
@@ -739,6 +850,18 @@ mod tests {
   use super::*;
 
   #[test]
+  fn image_fingerprint_matches_the_ci_script() {
+    // scripts/image-fingerprint on the same two files gives this value.
+    let directory = std::env::temp_dir().join(format!("docker-vm-fingerprint-{}", std::process::id()));
+    fs::create_dir_all(directory.join("ignored-subdirectory")).unwrap();
+    fs::write(directory.join("b"), "second\n").unwrap();
+    fs::write(directory.join("a"), "first\n").unwrap();
+    let value = fingerprint_dir(&directory);
+    fs::remove_dir_all(&directory).unwrap();
+    assert_eq!(value.unwrap(), "7275e4dd341a460f");
+  }
+
+  #[test]
   fn escapes_values_for_compose() {
     assert_eq!(compose_string(r#"/a "b" \c $HOME"#), r#""/a \"b\" \\c $$HOME""#);
     let control = compose_string(&char::from(1u8).to_string());
@@ -757,7 +880,7 @@ mod tests {
   #[test]
   fn gpu_override_adds_the_cdi_device() {
     assert_eq!(
-      gpu_override("nvidia.com/gpu=0", None),
+      gpu_override("nvidia.com/gpu=0", None, None),
       r#"{"services":{"desktop":{"devices":["nvidia.com/gpu=0"],"environment":{"DESKTOP_GPU":"nvidia"}}}}"#,
     );
   }
@@ -766,9 +889,29 @@ mod tests {
   fn gpu_override_adds_nvenc_service_and_other_gpu_nodes() {
     let video = VideoDevices { cuda_index: 0, other_nodes: vec!["/dev/nvidia1".into()] };
     assert_eq!(
-      gpu_override("nvidia.com/gpu=0", Some(&video)),
+      gpu_override("nvidia.com/gpu=0", Some(&video), None),
       r#"{"services":{"desktop":{"devices":["nvidia.com/gpu=0","/dev/nvidia1"],"environment":{"DESKTOP_GPU":"nvidia","DESKTOP_VIDEO":"nvenc","CUDA_DEVICE_ORDER":"PCI_BUS_ID","DESKTOP_VIDEO_CUDA_DEVICE":"0"}}}}"#,
     );
+  }
+
+  #[test]
+  fn gpu_override_mounts_the_host_x_driver() {
+    let xorg = XorgDisplay { driver: "/x/nvidia_drv.so".into(), glx: "/x/libglxserver_nvidia.so.595".into(), bus_id: "PCI:6:0:0".into() };
+    assert_eq!(
+      gpu_override("nvidia.com/gpu=0", None, Some(&xorg)),
+      concat!(
+        r#"{"services":{"desktop":{"devices":["nvidia.com/gpu=0"],"environment":{"DESKTOP_GPU":"nvidia","DESKTOP_XORG":"nvidia","DESKTOP_XORG_BUSID":"PCI:6:0:0"},"#,
+        r#""volumes":[{"type":"bind","source":"/x/nvidia_drv.so","target":"/opt/nvidia-xorg/drivers/nvidia_drv.so","read_only":true,"bind":{"create_host_path":false}},"#,
+        r#"{"type":"bind","source":"/x/libglxserver_nvidia.so.595","target":"/opt/nvidia-xorg/extensions/libglxserver_nvidia.so","read_only":true,"bind":{"create_host_path":false}}]}}}"#,
+      ),
+    );
+  }
+
+  #[test]
+  fn x_bus_ids_are_decimal_and_match_the_device_minor() {
+    assert_eq!(x_bus_id("0000:06:00.0").as_deref(), Some("PCI:6:0:0"));
+    assert_eq!(x_bus_id("0000:1a:1f.7").as_deref(), Some("PCI:26:31:7"));
+    assert_eq!(gpu_minor("Model: \t RTX\nDevice Minor: \t 1\n"), Some(1));
   }
 
   #[test]
