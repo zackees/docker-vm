@@ -208,15 +208,18 @@ export function nv12Pixel({ bytes, layout }, x, y) {
   return [clamp(luma + 1.5958 * v), clamp(luma - 0.39173 * u - 0.81290 * v), clamp(luma + 2.017 * u)];
 }
 
-// Confines RFB update requests to one pixel while `active()` is true.
+// While `active()` is true, RFB carries no frames: update requests are not
+// sent and continuous updates are switched off. (Confining them to one pixel
+// is not enough: wayvnc ignores the region and keeps encoding full frames.)
+// Input, resize and the cursor need no framebuffer updates; wayvnc draws the
+// cursor into the video frames.
 function quietRfb(RFB, active) {
   const messages = RFB.messages;
   const request = messages.fbUpdateRequest;
   const continuous = messages.enableContinuousUpdates;
-  messages.fbUpdateRequest = (sock, incremental, x, y, w, h) =>
-    active() ? request(sock, incremental, 0, 0, 1, 1) : request(sock, incremental, x, y, w, h);
+  messages.fbUpdateRequest = (...args) => { if (!active()) request(...args); };
   messages.enableContinuousUpdates = (sock, enable, x, y, w, h) =>
-    active() ? continuous(sock, enable, 0, 0, 1, 1) : continuous(sock, enable, x, y, w, h);
+    continuous(sock, active() ? false : enable, x, y, w, h);
   return () => { messages.fbUpdateRequest = request; messages.enableContinuousUpdates = continuous; };
 }
 
@@ -296,10 +299,10 @@ export async function startVideo(RFB, rfb, { video_url: url, video_capability: c
       const nextDescription = avcDescription(nals);
       if (next && nextDescription && (next !== codec || !sameBytes(nextDescription, description))) {
         const config = { codec: next, description: nextDescription, optimizeForLatency: true,
-                         // WebKitGTK's hardware path adds a GPU->CPU download
-                         // before our plane copy; software decode measured ~2x
-                         // the throughput at 2560x1600.
-                         hardwareAcceleration: 'prefer-software' };
+                         // Software decode cannot keep up at 2560x1600 (~6 fps on
+                         // a loaded host); NVDEC decodes ~100 fps and the WebGL
+                         // presenter needs ~11 ms per frame.
+                         hardwareAcceleration: 'prefer-hardware' };
         const { supported } = await VideoDecoder.isConfigSupported(config).catch(() => ({ supported: false }));
         if (!supported) return stop(`unsupported codec ${next}`);
         decoder.configure(config);

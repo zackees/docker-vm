@@ -35,7 +35,18 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
       gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 gstreamer1.0-plugins-base \
       gstreamer1.0-plugins-bad gstreamer1.0-x
 
-# Mount points for the host's NVIDIA X driver (GPU X server only).
+# Wayland GPU desktop: headless sway on the NVIDIA driver (GBM), wayvnc for
+# input and RFB fallback, PipeWire screencast for zero-copy NVENC capture.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update \
+ && apt-get install -y --no-install-recommends \
+      sway wayvnc xwayland pipewire wireplumber xdg-desktop-portal xdg-desktop-portal-wlr \
+      gstreamer1.0-pipewire gstreamer1.0-gl python3-dbus
+
+# Mount points for the host's NVIDIA X driver (GPU X server only). The GBM
+# allocator mounts (Wayland GPU desktop) need none: Docker creates them, and
+# empty placeholders there broke the DMA-BUF screencast negotiation.
 RUN install -d /opt/nvidia-xorg/drivers /opt/nvidia-xorg/extensions \
  && touch /opt/nvidia-xorg/drivers/nvidia_drv.so /opt/nvidia-xorg/extensions/libglxserver_nvidia.so \
  && useradd --create-home --uid 1000 --shell /bin/bash desktop \
@@ -48,6 +59,7 @@ COPY images/desktop/browser-backtrace.gdb /usr/local/share/browser-backtrace.gdb
 COPY --chmod=0755 images/desktop/display-scale /usr/local/bin/display-scale
 COPY --chmod=0755 images/desktop/video-stream /usr/local/bin/video-stream
 COPY --chmod=0755 images/desktop/display-size /usr/local/bin/display-size
+COPY --chmod=0755 images/desktop/wayland-session /usr/local/bin/wayland-session
 COPY images/desktop/display-scale.desktop /usr/share/applications/display-scale.desktop
 # GPU mode only: the NVIDIA CDI spec injects the driver libraries and device
 # nodes but not these loader registrations, so glvnd/Vulkan would never pick

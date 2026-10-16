@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""Wayland GPU desktop: headless sway on the NVIDIA driver, wayvnc for input
+and RFB fallback frames, PipeWire screencast for zero-copy NVENC capture.
+
+Run by ephemeral-session under dbus-run-session when the viewer selected it
+(DESKTOP_DISPLAY=wayland). Exits 75 (EX_TEMPFAIL) if the compositor or VNC
+server cannot start, so ephemeral-session falls back to Xtigervnc; otherwise
+runs until Chromium or sway exits.
+
+Frames: sway composites on the GPU; video-stream captures the output through
+xdg-desktop-portal-wlr as DMA-BUFs and NVENC encodes them without a CPU copy.
+Input, cursor and fallback frames: wayvnc (ARD auth with the session's VNC
+password; noVNC's RA2ne does not match wayvnc's RSA-AES types). Resize: wayvnc
+resizes the headless output on the client's RFB request. DPI (and a size from
+/run/session/display-size, if the viewer writes one): applied with swaymsg.
+Any output change bumps output-generation so video-stream renews its capture.
+"""
+from __future__ import annotations
+
+import glob
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+EX_TEMPFAIL = 75
+OUTPUT = "HEADLESS-1"
+SESSION = Path("/run/session")
+SIZE = re.compile(r"^(\d{2,5})x(\d{2,5})$")
+
+
+@dataclass(frozen=True)
+class Paths:
+    runtime: Path
+    config: Path
+    logs: Path
+
+
+@dataclass
+class Service:
+    """A helper process restarted whenever it exits."""
+    command: list[str]
+    extra_env: tuple[tuple[str, str], ...] = ()
+    process: subprocess.Popen | None = None
+
+    @property
+    def name(self) -> str:
+        return Path(self.command[0]).name
+
+
+@dataclass(frozen=True)
+class OutputMode:
+    width: int
+    height: int
+    scale: float
+
+
+def log(message: str) -> None:
+    print(f"wayland-session: {message}", file=sys.stderr, flush=True)
+
+
+def spawn(args: list[str], env: dict[str, str], name: str, paths: Paths) -> subprocess.Popen:
+    return subprocess.Popen(args, env=env, stdout=open(paths.logs / f"{name}.log", "w"), stderr=subprocess.STDOUT)
+
+
+def wait_for(predicate, seconds: float) -> bool:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def write_configs(paths: Paths, geometry: str) -> Path:
+    (paths.config / "xdg-desktop-portal-wlr").mkdir(parents=True, exist_ok=True)
+    (paths.config / "xdg-desktop-portal").mkdir(parents=True, exist_ok=True)
+    (paths.config / "xdg-desktop-portal-wlr" / "config").write_text(
+        f"[screencast]\nchooser_type=none\noutput_name={OUTPUT}\nmax_fps=60\n")
+    (paths.config / "xdg-desktop-portal" / "sway-portals.conf").write_text(
+        "[preferred]\ndefault=wlr\norg.freedesktop.impl.portal.ScreenCast=wlr\n")
+    width, _, height = geometry.partition("x")
+    sway = paths.runtime / "sway.conf"
+    sway.write_text(
+        f"output {OUTPUT} resolution {width}x{height}\n"
+        "default_border none\n"
+        "default_floating_border none\n"
+        "focus_follows_mouse no\n"
+        "xwayland enable\n")
+    # wayvnc: the session's VNC password, ARD (the only type noVNC shares).
+    password = Path(os.environ["VNC_PASSWORD_FILE"]).read_text().strip()
+    vnc = paths.runtime / "wayvnc.conf"
+    vnc.touch(mode=0o600)
+    vnc.write_text(f"address=0.0.0.0\nport=5900\nenable_auth=true\nusername=desktop\npassword={password}\n"
+                   "relax_encryption=true\n")
+    return sway
+
+
+def session_env(paths: Paths) -> dict[str, str]:
+    env = dict(os.environ)
+    env.pop("DISPLAY", None)
+    env.pop("LIBGL_ALWAYS_SOFTWARE", None)
+    render = sorted(glob.glob("/dev/dri/renderD*"))
+    env.update({
+        "XDG_RUNTIME_DIR": str(paths.runtime), "XDG_CONFIG_HOME": str(paths.config), "XDG_CURRENT_DESKTOP": "sway",
+        "WLR_BACKENDS": "headless", "WLR_LIBINPUT_NO_DEVICES": "1", "WLR_RENDERER": "gles2",
+        "GBM_BACKEND": "nvidia-drm", "__GLX_VENDOR_LIBRARY_NAME": "nvidia",
+        "GST_GL_PLATFORM": "egl", "GST_GL_WINDOW": "surfaceless",
+    })
+    if render:
+        env["WLR_RENDER_DRM_DEVICE"] = render[0]
+    return env
+
+
+class Output:
+    """Applies the viewer's size and scale requests to the headless output."""
+
+    def __init__(self, env: dict[str, str], geometry: str, generation: Path) -> None:
+        self.env = env
+        # Bumped after every applied change: a resize under a live screencast
+        # stalls it silently, so video-stream re-requests the screencast.
+        self.generation_file = generation
+        self.generation = 0
+        self.observed = ""
+        width, _, height = geometry.partition("x")
+        self.applied = OutputMode(int(width), int(height), 1.0)
+
+    def requested(self) -> OutputMode:
+        mode = self.applied
+        try:
+            match = SIZE.match((SESSION / "display-size").read_text().strip())
+            if match:
+                width, height = int(match.group(1)), int(match.group(2))
+                if 32 <= width <= 8192 and 32 <= height <= 8192 and width * height <= 3840 * 2160:
+                    mode = OutputMode(width, height, mode.scale)
+        except OSError:
+            pass
+        try:
+            scale = float((SESSION / "display-scale").read_text().strip())
+            if 0.5 <= scale <= 4.0:
+                mode = OutputMode(mode.width, mode.height, round(scale * 8) / 8)
+        except (OSError, ValueError):
+            pass
+        return mode
+
+    def current(self) -> str:
+        """The output's actual mode; wayvnc resizes it on client request."""
+        out = subprocess.run(["swaymsg", "-t", "get_outputs", "-r"], env=self.env, capture_output=True, text=True).stdout
+        match = re.search(r'"current_mode":\s*\{\s*"width":\s*(\d+),\s*"height":\s*(\d+)', out)
+        scale = re.search(r'"scale":\s*([\d.]+)', out)
+        return f"{match.group(1)}x{match.group(2)}@{scale.group(1) if scale else '?'}" if match else ""
+
+    def watch(self) -> None:
+        """Bump the generation on any output change, whoever made it."""
+        current = self.current()
+        if current and current != self.observed:
+            if self.observed:
+                self.generation += 1
+                temporary = self.generation_file.with_suffix(".next")
+                temporary.write_text(str(self.generation))
+                temporary.rename(self.generation_file)
+            self.observed = current
+
+    def poll(self) -> None:
+        mode = self.requested()
+        if mode == self.applied:
+            return
+        result = subprocess.run(
+            ["swaymsg", f"output {OUTPUT} resolution {mode.width}x{mode.height} scale {mode.scale}"],
+            env=self.env, capture_output=True, text=True)
+        if result.returncode == 0:
+            self.applied = mode
+        else:
+            log(f"output change failed: {result.stdout.strip()} {result.stderr.strip()}")
+            self.applied = mode  # do not retry a refused mode every tick
+
+
+def main() -> int:
+    home = Path(os.environ.get("HOME", "/home/desktop"))
+    paths = Paths(runtime=Path(os.environ.get("XDG_RUNTIME_DIR", "/run/user/1000")), config=home / ".config",
+                  logs=Path(os.environ.get("XDG_RUNTIME_DIR", "/run/user/1000")))
+    geometry = os.environ.get("DESKTOP_GEOMETRY", "1280x800")
+    # Start at the viewer's size when it already sent one: resizing under a
+    # live screencast forces the capture to renegotiate.
+    try:
+        requested = (SESSION / "display-size").read_text().strip()
+        if SIZE.match(requested):
+            geometry = requested
+    except OSError:
+        pass
+    sway_config = write_configs(paths, geometry)
+    env = session_env(paths)
+
+    sway = spawn(["sway", "--unsupported-gpu", "-c", str(sway_config)], env, "sway", paths)
+    def display() -> str | None:
+        names = sorted(p.name for p in paths.runtime.glob("wayland-*") if not p.name.endswith(".lock"))
+        return names[0] if names else None
+
+    if not wait_for(lambda: display() is not None or sway.poll() is not None, 15) or sway.poll() is not None:
+        log("sway did not start; see sway.log")
+        return EX_TEMPFAIL
+    env["WAYLAND_DISPLAY"] = display()
+    env["SWAYSOCK"] = next((str(p) for p in paths.runtime.glob("sway-ipc.*")), "")
+    subprocess.run(["dbus-update-activation-environment", "WAYLAND_DISPLAY", "XDG_CURRENT_DESKTOP",
+                    "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR"], env=env, check=False)
+
+    vnc = spawn(["wayvnc", "-C", str(paths.runtime / "wayvnc.conf"), "-o", OUTPUT, "-r"], env, "wayvnc", paths)
+    def listening() -> bool:
+        try:
+            socket.create_connection(("127.0.0.1", 5900), timeout=0.2).close()
+            return vnc.poll() is None
+        except OSError:
+            return False
+
+    if not wait_for(listening, 10):
+        log("wayvnc did not start; see wayvnc.log")
+        sway.terminate()
+        return EX_TEMPFAIL
+
+    # Helper services are restarted if they exit (e.g. the portal backend
+    # after its PipeWire stream ends on an output resize).
+    # xdg-desktop-portal(-wlr) are D-Bus activated on video-stream's first
+    # request (with the environment pushed above), not managed here.
+    services = [Service(["pipewire"]), Service(["wireplumber"])]
+    if os.environ.get("DESKTOP_VIDEO") == "nvenc":
+        services.append(Service(["video-stream"], extra_env=(("DESKTOP_CAPTURE", "pipewire"),)))
+
+    def supervise() -> None:
+        for service in services:
+            if service.process is None or service.process.poll() is not None:
+                if service.process is not None:
+                    log(f"{service.name} exited ({service.process.returncode}); restarting")
+                service.process = spawn(service.command, env | dict(service.extra_env), service.name, paths)
+                if service.name == "pipewire":
+                    time.sleep(0.5)
+
+    supervise()
+
+    chromium = spawn(["crash-watch", "/usr/lib/chromium/chromium",
+                      f"--user-data-dir={os.environ['CHROMIUM_USER_DATA_DIR']}",
+                      "--no-first-run", "--no-default-browser-check",
+                      "--ozone-platform=wayland", "--ignore-gpu-blocklist", "about:blank"], env, "chromium", paths)
+    output = Output(env, geometry, paths.runtime / "output-generation")
+    try:
+        ticks = 0
+        while chromium.poll() is None and sway.poll() is None:
+            output.poll()
+            output.watch()
+            if ticks % 5 == 0:
+                supervise()
+            ticks += 1
+            time.sleep(0.2)
+    finally:
+        for process in [chromium, *(service.process for service in services if service.process), vnc, sway]:
+            if process.poll() is None:
+                process.terminate()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

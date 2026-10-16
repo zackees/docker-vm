@@ -62,6 +62,42 @@ This deliberately widens the attack surface: remote Chromium content reaches
 the host's NVIDIA kernel driver through the GPU process. The device nodes and
 driver libraries come from the host's CDI spec; nothing else is added.
 
+### Wayland GPU desktop (default in GPU mode)
+
+Xvnc has no GPU, so the GPU path above still composites and encodes on the CPU.
+In GPU mode the viewer therefore starts a Wayland desktop instead
+(`DESKTOP_DISPLAY=wayland`; `DOCKER_VM_WAYLAND=off` opts out):
+
+- **Compositor**: headless sway (wlroots) renders on the NVIDIA driver through
+  GBM. The CDI spec omits NVIDIA's GBM backend, so the viewer bind-mounts the
+  host's own `libnvidia-allocator` read-only as `gbm/nvidia-drm_gbm.so` (it
+  always matches the kernel driver). Chromium runs natively on Wayland with
+  full GPU compositing.
+- **Frames**: `video-stream` asks xdg-desktop-portal (wlr backend, configured
+  to pick the headless output with no chooser) for a screencast and captures it
+  over PipeWire as DMA-BUFs: compositor buffer -> EGLImage -> CUDA -> NVENC,
+  never through the CPU. The portal offers buffer layouts it cannot always
+  allocate, so `video-stream` tries the layouts GStreamer GL can import one at a
+  time and logs which one streams; system memory is the last resort.
+  2560x1600 animation: ~55-60 fps, versus ~7-13 delivered by Xtigervnc/RFB.
+- **Input and fallback frames**: wayvnc. noVNC and wayvnc share only Apple
+  Remote Desktop authentication (Diffie-Hellman + AES-encrypted credentials),
+  so wayvnc gets user `desktop` and the session's VNC password with
+  `relax_encryption`; the RFB stream itself is unencrypted, as with Xvnc, and
+  is reachable only through the capability-gated loopback bridge.
+- **Resize and DPI**: wayvnc resizes the headless output on the client's RFB
+  `SetDesktopSize` (verified; it answers status 4 but applies the size and
+  announces it). The DPI scale is applied with `swaymsg`. A resize silently
+  stalls a live screencast, so `wayland-session` watches the output's actual
+  mode and bumps a generation file on any change; `video-stream` then renews
+  the screencast.
+- **Fallback**: if sway or wayvnc cannot start, `wayland-session` exits 75 and
+  `ephemeral-session` starts the Xtigervnc session described above.
+
+`DOCKER_VM_XORG=on` instead selects a headless Xorg on the NVIDIA X driver; it
+stays opt-in because reading its framebuffer back for VNC or capture is slower
+than Xtigervnc.
+
 Archive mounts are opt-in (`--mount type=zip`) and are the only other host binds.
 Each binds an empty directory beside the session directory read-only with
 `rslave` propagation; after `compose up`, the viewer mounts a FUSE view of the

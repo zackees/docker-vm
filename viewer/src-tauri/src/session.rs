@@ -252,10 +252,14 @@ impl SessionManager {
     let file = self.root.with_extension("gpu.yaml");
     let video = video_devices(device);
     let xorg = xorg_display(device);
+    // The X server is an explicit opt-in; otherwise the Wayland GPU desktop.
+    let wayland = if xorg.is_some() { None } else { wayland_display() };
     if let Some(xorg) = &xorg {
       progress.stage(&format!("Starting desktop container (GPU display server on {})…", xorg.bus_id));
+    } else if wayland.is_some() {
+      progress.stage("Starting desktop container (GPU Wayland desktop)…");
     }
-    write_secret(&file, gpu_override(device, video.as_ref(), xorg.as_ref()).as_bytes())?;
+    write_secret(&file, gpu_override(device, video.as_ref(), xorg.as_ref(), wayland.as_ref()).as_bytes())?;
     self.video.store(video.is_some(), Ordering::Release);
     self.overrides.lock().map_err(|_| "override lock unavailable")?.push(file.clone());
     match self.up() {
@@ -540,13 +544,46 @@ fn x_bus_id(address: &str) -> Option<String> {
 
 const XORG_MODULES: &str = "/opt/nvidia-xorg";
 
+/// The Wayland GPU desktop needs NVIDIA's GBM backend, which the CDI spec
+/// does not mount: the host's own `libnvidia-allocator` (it always matches
+/// the kernel driver), loaded as `gbm/nvidia-drm_gbm.so`.
+#[derive(Debug, PartialEq)]
+struct WaylandDisplay {
+  allocator: PathBuf,
+}
+
+const ALLOCATOR_CANDIDATES: [&str; 4] = [
+  "/run/opengl-driver/lib/libnvidia-allocator.so.1", // NixOS
+  "/usr/lib/x86_64-linux-gnu/libnvidia-allocator.so.1", // Debian, Ubuntu
+  "/usr/lib64/libnvidia-allocator.so.1",             // Fedora, openSUSE
+  "/usr/lib/libnvidia-allocator.so.1",               // Arch
+];
+const CONTAINER_LIBS: &str = "/usr/lib/x86_64-linux-gnu";
+
+/// Automatic in GPU mode; `DOCKER_VM_WAYLAND=off` opts out. The container
+/// falls back to its X session by itself if the compositor cannot start.
+fn wayland_display() -> Option<WaylandDisplay> {
+  if std::env::var_os("DOCKER_VM_WAYLAND").is_some_and(|value| value == "off") { return None; }
+  let allocator = ALLOCATOR_CANDIDATES.iter().find_map(|path| Path::new(path).canonicalize().ok())?;
+  Some(WaylandDisplay { allocator })
+}
+
 /// Compose override adding the CDI device and telling the session script to
 /// enable Chromium's GPU path, plus the NVENC video service and the GPU X
 /// server when possible.
-fn gpu_override(device: &str, video: Option<&VideoDevices>, xorg: Option<&XorgDisplay>) -> String {
+fn gpu_override(device: &str, video: Option<&VideoDevices>, xorg: Option<&XorgDisplay>, wayland: Option<&WaylandDisplay>) -> String {
   let mut devices = vec![compose_string(device)];
   let mut volumes = Vec::new();
   let mut environment = vec![r#""DESKTOP_GPU":"nvidia""#.to_string()];
+  if let Some(wayland) = wayland {
+    environment.push(r#""DESKTOP_DISPLAY":"wayland""#.into());
+    for target in ["gbm/nvidia-drm_gbm.so", "libnvidia-allocator.so.1"] {
+      volumes.push(format!(
+        r#"{{"type":"bind","source":{},"target":"{CONTAINER_LIBS}/{target}","read_only":true,"bind":{{"create_host_path":false}}}}"#,
+        compose_string(&wayland.allocator.to_string_lossy()),
+      ));
+    }
+  }
   if let Some(xorg) = xorg {
     environment.push(r#""DESKTOP_XORG":"nvidia""#.into());
     environment.push(format!(r#""DESKTOP_XORG_BUSID":{}"#, compose_string(&xorg.bus_id)));
@@ -880,7 +917,7 @@ mod tests {
   #[test]
   fn gpu_override_adds_the_cdi_device() {
     assert_eq!(
-      gpu_override("nvidia.com/gpu=0", None, None),
+      gpu_override("nvidia.com/gpu=0", None, None, None),
       r#"{"services":{"desktop":{"devices":["nvidia.com/gpu=0"],"environment":{"DESKTOP_GPU":"nvidia"}}}}"#,
     );
   }
@@ -889,7 +926,7 @@ mod tests {
   fn gpu_override_adds_nvenc_service_and_other_gpu_nodes() {
     let video = VideoDevices { cuda_index: 0, other_nodes: vec!["/dev/nvidia1".into()] };
     assert_eq!(
-      gpu_override("nvidia.com/gpu=0", Some(&video), None),
+      gpu_override("nvidia.com/gpu=0", Some(&video), None, None),
       r#"{"services":{"desktop":{"devices":["nvidia.com/gpu=0","/dev/nvidia1"],"environment":{"DESKTOP_GPU":"nvidia","DESKTOP_VIDEO":"nvenc","CUDA_DEVICE_ORDER":"PCI_BUS_ID","DESKTOP_VIDEO_CUDA_DEVICE":"0"}}}}"#,
     );
   }
@@ -898,11 +935,24 @@ mod tests {
   fn gpu_override_mounts_the_host_x_driver() {
     let xorg = XorgDisplay { driver: "/x/nvidia_drv.so".into(), glx: "/x/libglxserver_nvidia.so.595".into(), bus_id: "PCI:6:0:0".into() };
     assert_eq!(
-      gpu_override("nvidia.com/gpu=0", None, Some(&xorg)),
+      gpu_override("nvidia.com/gpu=0", None, Some(&xorg), None),
       concat!(
         r#"{"services":{"desktop":{"devices":["nvidia.com/gpu=0"],"environment":{"DESKTOP_GPU":"nvidia","DESKTOP_XORG":"nvidia","DESKTOP_XORG_BUSID":"PCI:6:0:0"},"#,
         r#""volumes":[{"type":"bind","source":"/x/nvidia_drv.so","target":"/opt/nvidia-xorg/drivers/nvidia_drv.so","read_only":true,"bind":{"create_host_path":false}},"#,
         r#"{"type":"bind","source":"/x/libglxserver_nvidia.so.595","target":"/opt/nvidia-xorg/extensions/libglxserver_nvidia.so","read_only":true,"bind":{"create_host_path":false}}]}}}"#,
+      ),
+    );
+  }
+
+  #[test]
+  fn gpu_override_mounts_the_gbm_allocator_for_wayland() {
+    let wayland = WaylandDisplay { allocator: "/x/libnvidia-allocator.so.595".into() };
+    assert_eq!(
+      gpu_override("nvidia.com/gpu=0", None, None, Some(&wayland)),
+      concat!(
+        r#"{"services":{"desktop":{"devices":["nvidia.com/gpu=0"],"environment":{"DESKTOP_GPU":"nvidia","DESKTOP_DISPLAY":"wayland"},"#,
+        r#""volumes":[{"type":"bind","source":"/x/libnvidia-allocator.so.595","target":"/usr/lib/x86_64-linux-gnu/gbm/nvidia-drm_gbm.so","read_only":true,"bind":{"create_host_path":false}},"#,
+        r#"{"type":"bind","source":"/x/libnvidia-allocator.so.595","target":"/usr/lib/x86_64-linux-gnu/libnvidia-allocator.so.1","read_only":true,"bind":{"create_host_path":false}}]}}}"#,
       ),
     );
   }
