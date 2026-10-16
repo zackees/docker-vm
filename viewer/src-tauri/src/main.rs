@@ -44,7 +44,7 @@ fn main() {
   tauri::Builder::default()
     .runtime(tauri_runtime_wry::Wry::default())
     .manage(manager)
-    .invoke_handler(tauri::generate_handler![status, connection, set_display_scale, stats_enabled, report_stats, rfb_tuning, video_event])
+    .invoke_handler(tauri::generate_handler![status, connection, set_display_scale, set_display_size, stats_enabled, report_stats, rfb_tuning, video_event])
     .setup(|app| {
       WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
         .title("Private desktop canvas")
@@ -135,6 +135,11 @@ fn status(manager: tauri::State<'_, Arc<SessionManager>>) -> Status {
 #[tauri::command]
 fn connection(manager: tauri::State<'_, Arc<SessionManager>>) -> Result<Connection, String> {
   manager.connection().ok_or_else(|| "session is no longer available".to_string())
+}
+
+#[tauri::command]
+fn set_display_size(manager: tauri::State<'_, Arc<SessionManager>>, width: u32, height: u32) -> Result<(), String> {
+  manager.set_display_size(width, height)
 }
 
 #[tauri::command]

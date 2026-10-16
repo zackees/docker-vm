@@ -113,6 +113,13 @@ try {
       .catch(error => { videoEvent(`failed to start: ${error.message}`); return false; });
     videoEvent(started ? 'hardware H.264 stream started' : 'not offered or not decodable; using VNC frames');
   }, { once: true });
+  // The GPU X server names its desktop so; it resizes through the host.
+  rfb.addEventListener('desktopname', event => {
+    if (event.detail.name === 'docker-vm GPU display') {
+      rfb.hostResize = size => window.__TAURI__.core.invoke('set_display_size', { width: size.w, height: size.h })
+        .catch(() => {});
+    }
+  });
   rfb.addEventListener('disconnect', event => {
     document.documentElement.classList.remove('connected');
     document.documentElement.classList.add('ended');

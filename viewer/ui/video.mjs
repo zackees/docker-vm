@@ -6,7 +6,9 @@
 
 const HEADER_BYTES = 13; // u32 length | u8 flags | u64 pts (us), big-endian
 const KEYFRAME = 1;
-const MAX_DECODE_QUEUE = 3;
+// WebKit's GStreamer decoder keeps several frames in flight; only a real
+// backlog (~0.5 s at 60 fps) means skipping ahead to the next keyframe.
+const MAX_DECODE_QUEUE = 30;
 
 const NAL_SPS = 7;
 const NAL_PPS = 8;
@@ -294,7 +296,10 @@ export async function startVideo(RFB, rfb, { video_url: url, video_capability: c
       const nextDescription = avcDescription(nals);
       if (next && nextDescription && (next !== codec || !sameBytes(nextDescription, description))) {
         const config = { codec: next, description: nextDescription, optimizeForLatency: true,
-                         hardwareAcceleration: 'prefer-hardware' };
+                         // WebKitGTK's hardware path adds a GPU->CPU download
+                         // before our plane copy; software decode measured ~2x
+                         // the throughput at 2560x1600.
+                         hardwareAcceleration: 'prefer-software' };
         const { supported } = await VideoDecoder.isConfigSupported(config).catch(() => ({ supported: false }));
         if (!supported) return stop(`unsupported codec ${next}`);
         decoder.configure(config);
