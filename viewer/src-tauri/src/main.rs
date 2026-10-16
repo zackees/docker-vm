@@ -6,6 +6,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod mounts;
+mod native_video;
 mod session;
 mod zipfs;
 
@@ -40,13 +41,17 @@ fn main() {
   });
   let managed = Arc::clone(&manager);
   stop_on_signal(Arc::clone(&manager));
+  let video = Arc::new(native_video::NativeVideo::default());
+  let video_at_exit = Arc::clone(&video);
 
   tauri::Builder::default()
     .runtime(tauri_runtime_wry::Wry::default())
     .manage(manager)
-    .invoke_handler(tauri::generate_handler![status, connection, set_display_scale, set_display_size, stats_enabled, report_stats, rfb_tuning, video_event])
-    .setup(|app| {
-      WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+    .manage(Arc::clone(&video))
+    .invoke_handler(tauri::generate_handler![status, connection, set_display_scale, set_display_size, stats_enabled, report_stats, rfb_tuning, video_event,
+      native_video_start, native_video_state, native_video_place])
+    .setup(move |app| {
+      let window = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
         .title("Private desktop canvas")
         .inner_size(1280., 800.)
         .min_inner_size(800., 500.)
@@ -55,12 +60,15 @@ fn main() {
         .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
         .on_permission_request(|_, _| tauri::webview::PermissionResponse::Deny)
         .build()?;
+      // GTK main thread: put the (hidden) native video layer over the webview.
+      native_video::install(&window, &video);
       Ok(())
     })
     .build(tauri::generate_context!())
     .expect("failed to build private WebKitGTK viewer")
     .run(move |_, event| {
       if matches!(event, RunEvent::Exit) {
+        video_at_exit.stop();
         managed.stop();
       }
     });
@@ -135,6 +143,25 @@ fn status(manager: tauri::State<'_, Arc<SessionManager>>) -> Status {
 #[tauri::command]
 fn connection(manager: tauri::State<'_, Arc<SessionManager>>) -> Result<Connection, String> {
   manager.connection().ok_or_else(|| "session is no longer available".to_string())
+}
+
+/// Starts native presentation of the container's NVENC stream; false when it
+/// is not offered or this host cannot present natively (the UI then uses its
+/// WebCodecs path).
+#[tauri::command]
+fn native_video_start(manager: tauri::State<'_, Arc<SessionManager>>, video: tauri::State<'_, Arc<native_video::NativeVideo>>) -> bool {
+  video.start(manager.video_address())
+}
+
+#[tauri::command]
+fn native_video_state(video: tauri::State<'_, Arc<native_video::NativeVideo>>) -> native_video::VideoState {
+  video.state()
+}
+
+/// Moves the native video layer onto noVNC's canvas (CSS px). Main thread.
+#[tauri::command]
+fn native_video_place(video: tauri::State<'_, Arc<native_video::NativeVideo>>, x: i32, y: i32, width: i32, height: i32) {
+  video.place(x, y, width, height);
 }
 
 #[tauri::command]

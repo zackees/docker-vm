@@ -195,7 +195,13 @@ def main() -> int:
     sway_config = write_configs(paths, geometry)
     env = session_env(paths)
 
-    sway = spawn(["sway", "--unsupported-gpu", "-c", str(sway_config)], env, "sway", paths)
+    # Verbose so the renderer is logged: a compositor that fell back to a
+    # software renderer is no GPU desktop, and the X session is better then.
+    try:
+        sway = spawn(["sway", "--unsupported-gpu", "--verbose", "-c", str(sway_config)], env, "sway", paths)
+    except OSError as error:
+        log(f"sway cannot run: {error}")
+        return EX_TEMPFAIL
     def display() -> str | None:
         names = sorted(p.name for p in paths.runtime.glob("wayland-*") if not p.name.endswith(".lock"))
         return names[0] if names else None
@@ -203,12 +209,22 @@ def main() -> int:
     if not wait_for(lambda: display() is not None or sway.poll() is not None, 15) or sway.poll() is not None:
         log("sway did not start; see sway.log")
         return EX_TEMPFAIL
+    sway_log = paths.logs / "sway.log"
+    if not wait_for(lambda: "EGL vendor: NVIDIA" in sway_log.read_text(errors="replace"), 5):
+        log("sway is not rendering on the NVIDIA GPU; see sway.log")
+        sway.terminate()
+        return EX_TEMPFAIL
     env["WAYLAND_DISPLAY"] = display()
     env["SWAYSOCK"] = next((str(p) for p in paths.runtime.glob("sway-ipc.*")), "")
     subprocess.run(["dbus-update-activation-environment", "WAYLAND_DISPLAY", "XDG_CURRENT_DESKTOP",
                     "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR"], env=env, check=False)
 
-    vnc = spawn(["wayvnc", "-C", str(paths.runtime / "wayvnc.conf"), "-o", OUTPUT, "-r"], env, "wayvnc", paths)
+    try:
+        vnc = spawn(["wayvnc", "-C", str(paths.runtime / "wayvnc.conf"), "-o", OUTPUT, "-r"], env, "wayvnc", paths)
+    except OSError as error:
+        log(f"wayvnc cannot run: {error}")
+        sway.terminate()
+        return EX_TEMPFAIL
     def listening() -> bool:
         try:
             socket.create_connection(("127.0.0.1", 5900), timeout=0.2).close()
