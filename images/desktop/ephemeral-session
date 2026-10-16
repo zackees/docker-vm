@@ -18,7 +18,7 @@ vncpasswd -f <"$VNC_PASSWORD_FILE" >"$password_file"
 
 geometry=${DESKTOP_GEOMETRY:-1280x800}
 
-# Wayland GPU desktop (viewer sets DESKTOP_DISPLAY=wayland in GPU mode): sway
+# Wayland GPU desktop (viewer sets DESKTOP_DISPLAY=wayland in GPU mode): labwc
 # on the GPU, wayvnc, PipeWire capture. It exits 75 when it cannot start; the
 # X session below is the fallback.
 if [[ ${DESKTOP_DISPLAY:-} == wayland ]]; then

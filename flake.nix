@@ -136,11 +136,11 @@
           # WEBKIT_DISABLE_COMPOSITING_MODE made every viewer GL context Mesa
           # llvmpipe: 22.6 fps shown at 2560x1600 vs 58.4 (= the page's fps)
           # with hardware GL, and nothing crashed without them
-          # (docs/GPU-PIPELINE.md).
+          # (docs/GPU-PIPELINE.md). GTK picks its native backend: under
+          # XWayland a HiDPI host gave the desktop half its pixels at 2x zoom.
           makeWrapper $out/libexec/docker-vm-viewer $out/bin/docker-vm \
             --run 'ulimit -c 0' \
             --set DOCKER_VM_RESOURCE_DIR $out/share/docker-vm \
-            --set GDK_BACKEND x11 \
             --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.docker pkgs.docker-compose pkgs.zenity ]}
           runHook postInstall
         '';

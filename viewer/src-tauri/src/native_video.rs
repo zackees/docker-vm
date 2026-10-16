@@ -81,6 +81,16 @@ pub fn install(window: &tauri::WebviewWindow, video: &NativeVideo) {
 }
 
 fn build_presenter(window: &tauri::WebviewWindow) -> Result<Presenter, String> {
+  // On Wayland, gtkglsink can share GTK's GL context only as desktop GL 3;
+  // with the default API choice its context creation fails. Under X11 the
+  // same choice stalls the sink, so it is set only here.
+  let wayland = window.gtk_window().ok()
+    .is_some_and(|gtk_window| gtk_window.display().type_().name() == "GdkWaylandDisplay");
+  if wayland && std::env::var_os("GST_GL_API").is_none() {
+    // SAFETY: runs on the GTK main thread during setup, before GStreamer or
+    // any thread of ours reads the environment.
+    unsafe { std::env::set_var("GST_GL_API", "opengl3") };
+  }
   gst::init().map_err(|error| format!("GStreamer: {error}"))?;
   let sink = gst::ElementFactory::make("gtkglsink").property("sync", false).build()
     .map_err(|_| "gtkglsink is not installed".to_string())?;
@@ -100,6 +110,19 @@ fn build_presenter(window: &tauri::WebviewWindow) -> Result<Presenter, String> {
   // the first frame, so it never covers the RFB canvas without video.
   widget.set_opacity(0.0);
   widget.set_size_request(1, 1);
+  // Pass-through alone is not enough: the sink's GL area has its own event
+  // window (it takes pointer input for navigation) and swallowed every click.
+  // An empty input shape on the overlay child window and all below it sends
+  // input to the webview.
+  widget.connect_realize(|widget| {
+    fn no_input(window: &gtk::gdk::Window) {
+      window.input_shape_combine_region(&gtk::cairo::Region::create(), 0, 0);
+      window.set_pass_through(true);
+      for child in window.children() { no_input(&child); }
+    }
+    if let Some(window) = widget.window() { no_input(&window); }
+  });
+  widget.set_sensitive(false);
   vbox.pack_start(&overlay, true, true, 0);
   overlay.show_all();
   Ok(Presenter { sink, widget: ThreadGuard::new(widget) })

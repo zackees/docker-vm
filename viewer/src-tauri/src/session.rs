@@ -225,7 +225,8 @@ impl SessionManager {
   fn video_bridge(&self, container: std::net::IpAddr) -> Result<Option<(SocketAddr, String)>, String> {
     if !self.video.load(Ordering::Acquire) { return Ok(None); }
     let address = SocketAddr::new(container, VIDEO_PORT);
-    if !wait_for_port(address, Duration::from_secs(8), &self.progress) {
+    // The first desktop start after an image build is slow (cold caches).
+    if !wait_for_port(address, Duration::from_secs(20), &self.progress) {
       eprintln!("hardware video unavailable; using VNC frames");
       return Ok(None);
     }

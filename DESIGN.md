@@ -68,8 +68,10 @@ Xvnc has no GPU, so the GPU path above still composites and encodes on the CPU.
 In GPU mode the viewer therefore starts a Wayland desktop instead
 (`DESKTOP_DISPLAY=wayland`; `DOCKER_VM_WAYLAND=off` opts out):
 
-- **Compositor**: headless sway (wlroots) renders on the NVIDIA driver through
-  GBM. The CDI spec omits NVIDIA's GBM backend, so the viewer bind-mounts the
+- **Compositor**: headless labwc (a stacking wlroots compositor) renders on the
+  NVIDIA driver through GBM, with the Xfce panel and desktop on top: windows
+  have title bars and can be moved, resized and launched from the menu. (A bare
+  tiling compositor left one borderless browser and nothing to move.) The CDI spec omits NVIDIA's GBM backend, so the viewer bind-mounts the
   host's own `libnvidia-allocator` read-only as `gbm/nvidia-drm_gbm.so` (it
   always matches the kernel driver). Chromium runs natively on Wayland with
   full GPU compositing.
@@ -87,13 +89,13 @@ In GPU mode the viewer therefore starts a Wayland desktop instead
   is reachable only through the capability-gated loopback bridge.
 - **Resize and DPI**: wayvnc resizes the headless output on the client's RFB
   `SetDesktopSize` (verified; it answers status 4 but applies the size and
-  announces it). The DPI scale is applied with `swaymsg`. A resize silently
+  announces it). The DPI scale is applied with `wlr-randr`. A resize silently
   stalls a live screencast, so `wayland-session` watches the output's actual
   mode and bumps a generation file on any change; `video-stream` then renews
   the screencast.
 - **Viewer**: decodes (NVDEC) and draws the stream natively in a GTK overlay
   on the noVNC canvas; see `docs/GPU-PIPELINE.md` for the measured pipeline.
-- **Fallback**: if sway or wayvnc cannot start, `wayland-session` exits 75 and
+- **Fallback**: if labwc or wayvnc cannot start, `wayland-session` exits 75 and
   `ephemeral-session` starts the Xtigervnc session described above.
 
 `DOCKER_VM_XORG=on` instead selects a headless Xorg on the NVIDIA X driver; it

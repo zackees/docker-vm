@@ -137,17 +137,18 @@ def run(*args: str, check: bool = False) -> str:
     return subprocess.run(args, capture_output=True, text=True, check=check).stdout
 
 
-WAYLAND_ENV = ("-e", "XDG_RUNTIME_DIR=/run/user/1000", "-e", "WAYLAND_DISPLAY=wayland-1")
+WAYLAND_ENV = ("-e", "XDG_RUNTIME_DIR=/run/user/1000", "-e", "WAYLAND_DISPLAY=wayland-0")
+DEVTOOLS_PORT = 9333
 
 
 def docker_exec(container: str, *args: str) -> str:
     return run("docker", "exec", "-e", "DISPLAY=:0", *WAYLAND_ENV, container, *args)
 
 
-def swaymsg(container: str, *args: str) -> str:
-    # swaymsg needs the compositor's IPC socket, whose name includes its PID.
-    return run("docker", "exec", *WAYLAND_ENV, container, "sh", "-c",
-               'SWAYSOCK=$(ls /run/user/1000/sway-ipc.*.sock) exec swaymsg "$@"', "swaymsg", *args)
+def page_titles(container: str) -> str:
+    # The bench page reports its fps in its title; Chromium's DevTools lists it.
+    return run("docker", "exec", container, "python3", "-c",
+               f"import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:{DEVTOOLS_PORT}/json').read().decode())")
 
 
 def label_for(cmdline: str) -> str:
@@ -237,12 +238,11 @@ def measure(variant: Variant, viewer_bin: Path, scale: str, seconds: float, logs
         container = wait_for_session(log, build_s=3600, run_s=120)
         time.sleep(12)
         processes = docker_exec(container, "ps", "-eo", "comm")
-        wayland = "sway" in processes
-        result.display_server = ("sway (GPU, Wayland)" if wayland else "Xorg (GPU)" if "Xorg" in processes
+        wayland = "labwc" in processes
+        result.display_server = ("labwc (GPU, Wayland)" if wayland else "Xorg (GPU)" if "Xorg" in processes
                                  else "Xtigervnc")
         if wayland:
-            mode = re.search(r'"current_mode":\s*\{\s*"width":\s*(\d+),\s*"height":\s*(\d+)',
-                             swaymsg(container, "-t", "get_outputs", "-r"))
+            mode = re.search(r"(\d+)x(\d+) px[^\n]*current", docker_exec(container, "wlr-randr"))
             result.framebuffer = f"{mode.group(1)}x{mode.group(2)}" if mode else "?"
             flags = ["--ozone-platform=wayland", "--ignore-gpu-blocklist"]
         else:
@@ -254,7 +254,7 @@ def measure(variant: Variant, viewer_bin: Path, scale: str, seconds: float, logs
         for setting in variant.xvnc_settings:
             docker_exec(container, "vncconfig", "-display", ":0", "-set", setting)
         subprocess.Popen(["docker", "exec", "-e", "DISPLAY=:0", *WAYLAND_ENV, container, "/usr/lib/chromium/chromium",
-                          "--user-data-dir=/tmp/bench", "--no-first-run", "--no-default-browser-check", "--kiosk",
+                          "--user-data-dir=/tmp/bench", f"--remote-debugging-port={DEVTOOLS_PORT}", "--no-first-run", "--no-default-browser-check", "--kiosk",
                           *flags, PAGE_URL], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(6)
         offset = len(log.read_text(errors="replace"))
@@ -269,8 +269,7 @@ def measure(variant: Variant, viewer_bin: Path, scale: str, seconds: float, logs
         result.stats = stats_after(log, offset)
         service_log = docker_exec(container, "cat", "/run/user/1000/video-stream.log")
         (logs / f"video-stream-{variant.label}.log").write_text(service_log)
-        titles = (swaymsg(container, "-t", "get_tree", "-r") if wayland
-                  else docker_exec(container, "xwininfo", "-root", "-tree"))
+        titles = page_titles(container)
         fps = re.search(r"fps [\d.]+", titles)
         result.page_fps = fps.group(0).removeprefix("fps ") if fps else "?"
     except (RuntimeError, TimeoutError) as error:
