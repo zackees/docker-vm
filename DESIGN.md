@@ -93,6 +93,17 @@ In GPU mode the viewer therefore starts a Wayland desktop instead
   stalls a live screencast, so `wayland-session` watches the output's actual
   mode and bumps a generation file on any change; `video-stream` then renews
   the screencast.
+- **Cursor**: drawn locally by the host. The headless output has no cursor
+  plane, so the compositor would paint the cursor into every captured frame
+  and it would trail the hand by a full encode/decode round trip; the session
+  therefore uses a transparent cursor theme and the viewer shows the host's
+  arrow over the canvas (shape changes such as the text I-beam are not
+  mirrored).
+- **Audio**: `audio-stream` makes a null sink the default output of the
+  session's PipeWire (PulseAudio API), Opus-encodes its monitor (48 kHz
+  stereo, 10 ms frames) and serves it on TCP 5902 on the container network;
+  the viewer plays it with GStreamer on the host's default output. Output
+  only: there is no microphone path into the container.
 - **Viewer**: decodes (NVDEC) and draws the stream natively in a GTK overlay
   on the noVNC canvas; see `docs/GPU-PIPELINE.md` for the measured pipeline.
 - **Fallback**: if labwc or wayvnc cannot start, `wayland-session` exits 75 and

@@ -9,3 +9,5 @@ main { display: flex; align-items: center; justify-content: center; }
 #log:empty { display: none; }
 .connected #status { display: none; }
 @keyframes spin { to { transform: rotate(360deg); } }
+/* noVNC sets the server's (invisible) cursor inline; the local one wins. */
+.local-cursor main canvas { cursor: default !important; }

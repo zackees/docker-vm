@@ -42,7 +42,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get update \
  && apt-get install -y --no-install-recommends \
       labwc wlr-randr wayvnc xwayland pipewire wireplumber xdg-desktop-portal xdg-desktop-portal-wlr \
-      gstreamer1.0-pipewire gstreamer1.0-gl python3-dbus
+      gstreamer1.0-pipewire gstreamer1.0-gl python3-dbus \
+      pipewire-pulse pulseaudio-utils gstreamer1.0-pulseaudio
 
 # Mount points for the host's NVIDIA X driver (GPU X server only). The GBM
 # allocator mounts (Wayland GPU desktop) need none: Docker creates them, and
@@ -60,6 +61,7 @@ COPY --chmod=0755 images/desktop/display-scale /usr/local/bin/display-scale
 COPY --chmod=0755 images/desktop/video-stream /usr/local/bin/video-stream
 COPY --chmod=0755 images/desktop/display-size /usr/local/bin/display-size
 COPY --chmod=0755 images/desktop/wayland-session /usr/local/bin/wayland-session
+COPY --chmod=0755 images/desktop/audio-stream /usr/local/bin/audio-stream
 COPY images/desktop/display-scale.desktop /usr/share/applications/display-scale.desktop
 # GPU mode only: the NVIDIA CDI spec injects the driver libraries and device
 # nodes but not these loader registrations, so glvnd/Vulkan would never pick
