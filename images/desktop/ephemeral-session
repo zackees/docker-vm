@@ -145,7 +145,15 @@ fi
 if [[ ${DESKTOP_VIDEO:-} == nvenc ]]; then
   video-stream 2>"$XDG_RUNTIME_DIR/video-stream.log" &
 fi
+# Desktop audio, as on the Wayland desktop: PipeWire with its PulseAudio
+# server; audio-stream makes a null sink the default and serves it (Opus,
+# TCP 5902). Logs go to the runtime tmpfs.
 dbus-run-session -- sh -c '
+  pipewire >"$XDG_RUNTIME_DIR/pipewire.log" 2>&1 &
+  sleep 0.5
+  wireplumber >"$XDG_RUNTIME_DIR/wireplumber.log" 2>&1 &
+  pipewire-pulse >"$XDG_RUNTIME_DIR/pipewire-pulse.log" 2>&1 &
+  audio-stream 2>"$XDG_RUNTIME_DIR/audio-stream.log" &
   startxfce4 &
   display-scale &
   exec crash-watch /usr/lib/chromium/chromium \
