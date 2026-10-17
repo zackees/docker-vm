@@ -77,3 +77,17 @@ Nothing crashed or went blank without the software flags. With labwc and the
 native Wayland viewer: 53.0 fps shown of 58.0 rendered at 2560x1600. Check a host with `nvidia-smi` while the viewer runs: both processes
 should be listed. The viewer log line `native video: first frame presented`
 shows the native path is live.
+
+## Audio and input, measured
+
+Through the real viewer (Xvfb host display, Wayland GPU desktop):
+
+| Check | Result |
+|---|---|
+| Audio vs video, real Chromium (white flash + beep together, 10 pairs, twice) | sound 29-30 ms after the picture (median), every pair within ±52 ms |
+| Beep in the container → viewer's output stream | ~225 ms (GPU desktop), ~262 ms (X desktop, CPU mode) |
+| Ctrl+L / Ctrl+A / Ctrl+C / Ctrl+V, typing | work (text copied and pasted twice) |
+| Alt+Tab between two windows | works |
+
+On a host desktop, shortcuts the host compositor itself takes (e.g. Alt+Tab
+under KDE) never reach the viewer window.
