@@ -53,6 +53,8 @@ pub struct NativeVideo {
   frames: Arc<AtomicU64>,
   stop: Arc<AtomicBool>,
   started: AtomicBool,
+  // Set while the settings panel is open over the video.
+  hidden: Arc<AtomicBool>,
 }
 
 impl Default for NativeVideo {
@@ -64,6 +66,7 @@ impl Default for NativeVideo {
       frames: Arc::new(AtomicU64::new(0)),
       stop: Arc::new(AtomicBool::new(false)),
       started: AtomicBool::new(false),
+      hidden: Arc::new(AtomicBool::new(false)),
     }
   }
 }
@@ -123,6 +126,19 @@ fn build_presenter(window: &tauri::WebviewWindow) -> Result<Presenter, String> {
     if let Some(window) = widget.window() { no_input(&window); }
   });
   widget.set_sensitive(false);
+  // The settings button must sit above the video, so it is a GTK widget in
+  // the same overlay; it opens the page's settings panel.
+  let settings = gtk::Button::with_label("⚙");
+  settings.set_tooltip_text(Some("Settings"));
+  settings.set_halign(gtk::Align::End);
+  settings.set_valign(gtk::Align::Start);
+  settings.set_margin_top(6);
+  settings.set_margin_end(6);
+  settings.set_opacity(0.55);
+  settings.set_relief(gtk::ReliefStyle::None);
+  let page = window.clone();
+  settings.connect_clicked(move |_| { let _ = page.eval("window.__toggleSettings?.()"); });
+  overlay.add_overlay(&settings);
   vbox.pack_start(&overlay, true, true, 0);
   overlay.show_all();
   Ok(Presenter { sink, widget: ThreadGuard::new(widget) })
@@ -138,6 +154,19 @@ impl NativeVideo {
   }
 
   pub fn frames(&self) -> u64 { self.frames.load(Ordering::Relaxed) }
+
+  /// Whether the native settings button is present (the page then hides its
+  /// own, which the video layer would cover).
+  pub fn has_controls(&self) -> bool {
+    self.presenter.lock().is_ok_and(|presenter| presenter.is_some())
+  }
+
+  /// Hides (or restores) live video, e.g. under the settings panel.
+  pub fn set_hidden(self: &Arc<Self>, hidden: bool) {
+    self.hidden.store(hidden, Ordering::Release);
+    let live = matches!(self.state(), VideoState::Live { .. });
+    self.show(live && !hidden);
+  }
 
   fn set(&self, state: VideoState) {
     if let Ok(mut current) = self.state.lock() { *current = state; }
@@ -187,7 +216,9 @@ impl NativeVideo {
     gtk::glib::MainContext::default().invoke(move || {
       if let Ok(presenter) = video.presenter.lock() && let Some(presenter) = presenter.as_ref() {
         let widget = presenter.widget.get_ref();
-        widget.set_opacity(if visible { 1.0 } else { 0.0 });
+        // Hidden under the settings panel keeps its place; stopped does not.
+        let hidden = video.hidden.load(Ordering::Acquire);
+        widget.set_opacity(if visible && !hidden { 1.0 } else { 0.0 });
         if !visible { widget.set_size_request(1, 1); }
       }
     });

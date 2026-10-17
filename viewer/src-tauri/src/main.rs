@@ -9,6 +9,7 @@ mod mounts;
 mod native_audio;
 mod native_video;
 mod session;
+mod settings;
 mod zipfs;
 
 use std::sync::Arc;
@@ -36,7 +37,7 @@ fn main() {
   });
   // Returns at once: Docker work runs in the background while the window
   // shows its progress.
-  let manager = SessionManager::start(archives).unwrap_or_else(|error| {
+  let manager = SessionManager::start(archives, settings::load()).unwrap_or_else(|error| {
     eprintln!("private session refused: {error}");
     std::process::exit(1);
   });
@@ -53,7 +54,8 @@ fn main() {
     .manage(Arc::clone(&video))
     .manage(audio)
     .invoke_handler(tauri::generate_handler![status, connection, set_display_scale, set_display_size, stats_enabled, report_stats, rfb_tuning, video_event,
-      native_video_start, native_video_state, native_video_place, native_audio_start])
+      native_video_start, native_video_state, native_video_place, native_audio_start,
+      native_video_hidden, native_controls, settings_view, save_settings, restart_session])
     .setup(move |app| {
       let window = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
         .title("Private desktop canvas")
@@ -156,6 +158,36 @@ fn connection(manager: tauri::State<'_, Arc<SessionManager>>) -> Result<Connecti
 #[tauri::command]
 fn native_video_start(manager: tauri::State<'_, Arc<SessionManager>>, video: tauri::State<'_, Arc<native_video::NativeVideo>>) -> bool {
   video.start(manager.video_address())
+}
+
+/// Hides the native video layer while the settings panel is open over it.
+#[tauri::command]
+fn native_video_hidden(video: tauri::State<'_, Arc<native_video::NativeVideo>>, hidden: bool) {
+  video.set_hidden(hidden);
+}
+
+#[tauri::command]
+fn native_controls(video: tauri::State<'_, Arc<native_video::NativeVideo>>) -> bool {
+  video.has_controls()
+}
+
+#[tauri::command]
+fn settings_view(manager: tauri::State<'_, Arc<SessionManager>>) -> settings::SettingsView {
+  manager.settings_view()
+}
+
+/// Saves the choices; they apply when the next session starts.
+#[tauri::command]
+fn save_settings(gpu: settings::Mode, wayland: settings::Mode, video: settings::Mode) -> Result<(), String> {
+  settings::save(settings::Settings { gpu, wayland, video })
+}
+
+/// Ends this session (container removed) and relaunches the viewer, which
+/// starts a fresh session with the saved settings.
+#[tauri::command]
+fn restart_session(app: tauri::AppHandle, manager: tauri::State<'_, Arc<SessionManager>>) {
+  manager.stop();
+  app.restart();
 }
 
 /// Starts playing the desktop's audio, if the container offers it.
