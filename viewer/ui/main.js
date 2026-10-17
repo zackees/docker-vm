@@ -4,11 +4,13 @@
 import RFB from './novnc/core/rfb.js';
 import { physicalRFB } from './physical-rfb.mjs';
 import { nv12Pixel, startNativeVideo, startVideo } from './video.mjs';
+import { settingsPanel } from './settings.mjs';
 import * as Log from './novnc/core/util/logging.js';
 
 Log.initLogging('error');
 
 window.__viewerLoaded = true;
+settingsPanel(document);
 const status = document.querySelector('#status');
 const stage = document.querySelector('#stage');
 const log = document.querySelector('#log');

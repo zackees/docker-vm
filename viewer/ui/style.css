@@ -11,3 +11,15 @@ main { display: flex; align-items: center; justify-content: center; }
 @keyframes spin { to { transform: rotate(360deg); } }
 /* noVNC sets the server's (invisible) cursor inline; the local one wins. */
 .local-cursor main canvas { cursor: default !important; }
+#settings-toggle { position: fixed; top: 6px; right: 6px; z-index: 10; width: 28px; height: 28px; padding: 0; border: 0; border-radius: 6px; background: rgba(23, 23, 23, 0.55); color: #ddd; font: 16px/28px system-ui, sans-serif; cursor: pointer; opacity: 0.45; }
+#settings-toggle:hover, #settings-toggle[aria-expanded="true"] { opacity: 1; }
+#settings { position: fixed; top: 40px; right: 6px; z-index: 10; width: 280px; padding: 12px 14px; border-radius: 8px; background: #222; color: #ddd; font: 13px system-ui, sans-serif; box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5); }
+#settings[hidden] { display: none; }
+#settings h2 { margin: 0 0 8px; font-size: 14px; }
+#settings fieldset { margin: 0 0 10px; padding: 6px 8px; border: 1px solid #444; border-radius: 6px; }
+#settings legend { padding: 0 4px; color: #aaa; }
+#settings label { display: block; margin: 3px 0; }
+#settings fieldset.greyed label { color: #777; }
+#settings .unavailable { margin: 4px 0 0; color: #c9a26b; font-size: 12px; }
+#settings-note, #settings-overrides { margin: 6px 0; color: #999; font-size: 12px; }
+#settings-restart { padding: 4px 10px; border: 1px solid #555; border-radius: 6px; background: #333; color: #ddd; cursor: pointer; }

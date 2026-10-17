@@ -20,6 +20,7 @@ use tokio_tungstenite::{accept_hdr_async, tungstenite::{handshake::server::{Requ
 use uuid::Uuid;
 
 use crate::{
+  settings::{self, HostSupport, Mode, Settings, SettingsView},
   mounts::{Options, ZipMount},
   zipfs::{self, Archive, Password, ZipFs},
 };
@@ -63,6 +64,10 @@ pub struct SessionManager {
   video_address: Mutex<Option<SocketAddr>>,
   // The container's audio stream (Wayland desktop only; absent otherwise).
   audio_address: Mutex<Option<SocketAddr>>,
+  // Choices this session started with, and what the host supports (filled in
+  // by the worker before any Docker work).
+  settings: Settings,
+  host: Mutex<Option<HostSupport>>,
   // RFB bytes forwarded to the viewer; read only by `DOCKER_VM_STATS` reports.
   bridged_bytes: Arc<AtomicU64>,
 }
@@ -140,7 +145,7 @@ impl Progress {
 impl SessionManager {
   /// Prepares the private session directory and returns immediately; Docker
   /// work (image build, container start, VNC wait) runs on a worker thread.
-  pub fn start(mounts: Vec<PreparedMount>) -> Result<Arc<Self>, String> {
+  pub fn start(mounts: Vec<PreparedMount>, settings: Settings) -> Result<Arc<Self>, String> {
     let runtime = runtime_dir()?;
     ensure_tmpfs(&runtime)?;
     let project = format!("docker-vm-{}", Uuid::new_v4().simple());
@@ -159,6 +164,7 @@ impl SessionManager {
     let manager = Arc::new(Self {
       root, project, overrides: Mutex::new(overrides), mounts_dir, mount_points,
       archive_mounts: Mutex::new(Vec::new()), progress, startup: Mutex::new(None), shutdown: Mutex::new(Vec::new()), video: AtomicBool::new(false), video_address: Mutex::new(None), audio_address: Mutex::new(None),
+      settings, host: Mutex::new(None),
       bridged_bytes: Arc::new(AtomicU64::new(0)),
     });
     let password = secret(24)?;
@@ -191,9 +197,11 @@ impl SessionManager {
       let binds: Vec<(&Path, &str)> = self.mount_points.iter().map(PathBuf::as_path).zip(mounts.iter().map(|mount| mount.target.as_str())).collect();
       write_secret(&self.overrides()[0], mount_override(&binds)?.as_bytes())?;
     }
-    ensure_image(progress)?;
     progress.stage("Checking for GPU acceleration…");
-    match gpu_device() {
+    let host = host_support();
+    *self.host.lock().map_err(|_| "host lock unavailable")? = Some(host.clone());
+    ensure_image(progress)?;
+    match self.gpu_device(&host) {
       Ok(device) => self.up_with_gpu(&device)?,
       Err(reason) => {
         eprintln!("CPU rendering: {reason}");
@@ -250,6 +258,20 @@ impl SessionManager {
     self.video_address.lock().ok().and_then(|address| *address)
   }
 
+  /// The device for GPU rendering, or why this session renders on the CPU.
+  fn gpu_device(&self, host: &HostSupport) -> Result<String, String> {
+    if settings::env_off("DOCKER_VM_GPU") { return Err("disabled by DOCKER_VM_GPU=off".into()); }
+    if self.settings.gpu == Mode::Off { return Err("GPU rendering is off in settings".into()); }
+    host.device().map(str::to_string).map_err(str::to_string)
+  }
+
+  /// Saved settings (as they will apply at the next start) plus what this
+  /// host supports, for the settings panel.
+  pub fn settings_view(&self) -> SettingsView {
+    let host = self.host.lock().ok().and_then(|host| host.clone());
+    SettingsView::new(settings::load(), host.as_ref())
+  }
+
   fn overrides(&self) -> Vec<PathBuf> {
     self.overrides.lock().map(|overrides| overrides.clone()).unwrap_or_default()
   }
@@ -267,10 +289,10 @@ impl SessionManager {
     progress.stage(&format!("Starting desktop container (GPU rendering on {device})…"));
     // Beside the session directory, so the container never sees it.
     let file = self.root.with_extension("gpu.yaml");
-    let video = video_devices(device);
+    let video = (self.settings.video == Mode::Auto).then(|| video_devices(device)).flatten();
     let xorg = xorg_display(device);
     // The X server is an explicit opt-in; otherwise the Wayland GPU desktop.
-    let wayland = if xorg.is_some() { None } else { wayland_display() };
+    let wayland = if xorg.is_some() || self.settings.wayland == Mode::Off { None } else { wayland_display() };
     if let Some(xorg) = &xorg {
       progress.stage(&format!("Starting desktop container (GPU display server on {})…", xorg.bus_id));
     } else if wayland.is_some() {
@@ -447,19 +469,17 @@ fn mount_override(binds: &[(&Path, &str)]) -> Result<String, String> {
   Ok(format!(r#"{{"services":{{"desktop":{{"volumes":[{}]}}}}}}"#, volumes.join(",")))
 }
 
-/// The NVIDIA CDI device for GPU rendering, or why the session renders on the
-/// CPU. GPU mode is automatic: it needs KVM enabled (it is switched on only
-/// selectively on some hosts) and an NVIDIA GPU that Docker exposes via CDI.
-/// `DOCKER_VM_GPU=off` opts out.
-fn gpu_device() -> Result<String, String> {
-  if std::env::var_os("DOCKER_VM_GPU").is_some_and(|value| value == "off") {
-    return Err("disabled by DOCKER_VM_GPU=off".into());
-  }
-  fs::File::options().read(true).write(true).open("/dev/kvm")
-    .map_err(|error| format!("KVM is not enabled (/dev/kvm: {error})"))?;
-  let output = Command::new("docker").args(["info", "-f", "{{json .DiscoveredDevices}}"]).stderr(Stdio::null()).output()
-    .map_err(|error| format!("run docker info: {error}"))?;
-  pick_gpu(&String::from_utf8_lossy(&output.stdout)).ok_or_else(|| "no NVIDIA GPU is exposed to Docker".into())
+/// What this host offers for GPU rendering. It needs KVM enabled (switched on
+/// only selectively on some hosts) and an NVIDIA GPU that Docker exposes via
+/// CDI. Settings and `DOCKER_VM_GPU=off` can still turn it off.
+fn host_support() -> HostSupport {
+  let kvm = fs::File::options().read(true).write(true).open("/dev/kvm")
+    .map(drop)
+    .map_err(|error| format!("KVM is not enabled (/dev/kvm: {error})"));
+  let gpu = Command::new("docker").args(["info", "-f", "{{json .DiscoveredDevices}}"]).stderr(Stdio::null()).output()
+    .map_err(|error| format!("run docker info: {error}"))
+    .and_then(|output| pick_gpu(&String::from_utf8_lossy(&output.stdout)).ok_or_else(|| "no NVIDIA GPU is exposed to Docker".into()));
+  HostSupport { kvm, gpu }
 }
 
 /// Lowest-numbered `nvidia.com/gpu=N` in `docker info`'s DiscoveredDevices

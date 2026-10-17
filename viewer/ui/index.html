@@ -13,6 +13,31 @@
       <p id="stage">Starting an ephemeral desktop session…</p>
       <pre id="log"></pre>
     </section>
+    <button id="settings-toggle" type="button" aria-label="Settings" aria-expanded="false" aria-controls="settings">⚙</button>
+    <section id="settings" hidden aria-label="Settings">
+      <h2>Settings</h2>
+      <fieldset id="gpu-setting">
+        <legend>GPU rendering</legend>
+        <label><input type="radio" name="gpu" value="auto"> Auto (when available)</label>
+        <label><input type="radio" name="gpu" value="off"> Off (CPU)</label>
+        <p class="unavailable" hidden></p>
+      </fieldset>
+      <fieldset id="wayland-setting">
+        <legend>GPU desktop</legend>
+        <label><input type="radio" name="wayland" value="auto"> Auto (fast Wayland desktop, sound)</label>
+        <label><input type="radio" name="wayland" value="off"> Classic X desktop</label>
+        <p class="unavailable" hidden></p>
+      </fieldset>
+      <fieldset id="video-setting">
+        <legend>Video transport</legend>
+        <label><input type="radio" name="video" value="auto"> Auto (hardware H.264)</label>
+        <label><input type="radio" name="video" value="off"> VNC only</label>
+        <p class="unavailable" hidden></p>
+      </fieldset>
+      <p id="settings-note">Changes apply to the next session.</p>
+      <p id="settings-overrides" hidden></p>
+      <button id="settings-restart" type="button">Restart session</button>
+    </section>
     <script src="boot.js"></script>
     <script type="module" src="main.js"></script>
   </body>

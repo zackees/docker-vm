@@ -103,7 +103,8 @@ In GPU mode the viewer therefore starts a Wayland desktop instead
   session's PipeWire (PulseAudio API), Opus-encodes its monitor (48 kHz
   stereo, 10 ms frames) and serves it on TCP 5902 on the container network;
   the viewer plays it with GStreamer on the host's default output. Output
-  only: there is no microphone path into the container.
+  only: there is no microphone path into the container. The X desktop (CPU
+  mode and fallbacks) runs the same audio service.
 - **Viewer**: decodes (NVDEC) and draws the stream natively in a GTK overlay
   on the noVNC canvas; see `docs/GPU-PIPELINE.md` for the measured pipeline.
 - **Fallback**: if labwc or wayvnc cannot start, `wayland-session` exits 75 and
