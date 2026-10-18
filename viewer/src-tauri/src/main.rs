@@ -11,6 +11,7 @@ mod native_video;
 mod session;
 mod settings;
 mod dirfs;
+mod file_menu;
 mod zipfs;
 
 use std::sync::Arc;
@@ -43,6 +44,7 @@ fn main() {
     std::process::exit(1);
   });
   let managed = Arc::clone(&manager);
+  let menu_manager = Arc::clone(&manager);
   stop_on_signal(Arc::clone(&manager));
   let video = Arc::new(native_video::NativeVideo::default());
   let video_at_exit = Arc::clone(&video);
@@ -69,6 +71,9 @@ fn main() {
         .build()?;
       // GTK main thread: put the (hidden) native video layer over the webview.
       native_video::install(&window, &video);
+      // Install the menubar after wrapping the webview, so the video layer and
+      // noVNC canvas continue to share the same content origin below it.
+      file_menu::install(app.handle().clone(), window, Arc::clone(&menu_manager))?;
       Ok(())
     })
     .build(tauri::generate_context!())
