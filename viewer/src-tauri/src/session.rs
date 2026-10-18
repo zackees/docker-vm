@@ -378,6 +378,24 @@ impl SessionManager {
     Ok(name)
   }
 
+  /// Opens and verifies a selected archive before exposing it in the live drop zone.
+  /// The caller must be a native picker, never a webview command accepting a path.
+  pub fn mount_archive_live(&self, source: PathBuf) -> Result<String, String> {
+    let tier = self.sharing_status().allowed_now;
+    if tier == SharingTier::Off { return Err("file sharing is off for this session".into()); }
+    ensure_mount_owner(&self.root)?;
+    let mut archive = Archive::open(&source)?;
+    if tier == SharingTier::Encrypted && !archive.all_encrypted() {
+      return Err("Encrypted archives only requires every file entry in the ZIP to be encrypted".into());
+    }
+    let kind = if archive.all_encrypted() { LiveKind::EncryptedArchive } else { LiveKind::Archive };
+    let password = if archive.is_encrypted() { Some(prompt_archive_password(&mut archive, &source)?) } else { None };
+    let owner = self.root.metadata().map_err(|error| error.to_string())?;
+    self.mount_live(source, kind, false, move |_, point| {
+      zipfs::mount(ZipFs::new(archive, password, owner.uid(), owner.gid()), point)
+    })
+  }
+
   pub fn unmount_live(&self, name: &str) -> Result<(), String> {
     let mut mounts = self.live_mounts.lock().map_err(|_| "live mount lock unavailable")?;
     let index = mounts.iter().position(|mount| mount.name == name).ok_or("share is not mounted")?;
@@ -523,15 +541,17 @@ fn archive_password(archive: &mut Archive, mount: &ZipMount, stdin: Option<&Pass
   let (password, origin) = match (&mount.password_file, stdin) {
     (Some(file), _) => (read_password_file(file)?, format!("password-file {}", file.display())),
     (None, Some(password)) => (password.duplicate(), "standard input".to_string()),
-    (None, None) => {
-      for attempt in 0..PASSWORD_ATTEMPTS {
-        let password = prompt_password(&mount.source, attempt > 0)?;
-        if archive.check_password(&password)? { return Ok(password); }
-      }
-      return Err(format!("wrong password for {source}"));
-    }
+    (None, None) => return prompt_archive_password(archive, &mount.source),
   };
   if archive.check_password(&password)? { Ok(password) } else { Err(format!("wrong password for {source} from {origin}")) }
+}
+
+fn prompt_archive_password(archive: &mut Archive, source: &Path) -> Result<Password, String> {
+  for attempt in 0..PASSWORD_ATTEMPTS {
+    let password = prompt_password(source, attempt > 0)?;
+    if archive.check_password(&password)? { return Ok(password); }
+  }
+  Err(format!("wrong password for {}", source.display()))
 }
 
 fn read_password_file(path: &Path) -> Result<Password, String> {
