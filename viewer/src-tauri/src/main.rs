@@ -10,6 +10,7 @@ mod native_audio;
 mod native_video;
 mod session;
 mod settings;
+mod dirfs;
 mod zipfs;
 
 use std::sync::Arc;
