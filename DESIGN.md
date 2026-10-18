@@ -134,17 +134,30 @@ zeroed when dropped. Archive paths are sanitized: absolute and `..` entries and
 symlinks are not exposed.
 
 For live file sharing, the viewer binds an initially empty tmpfs drop zone to
-`/home/desktop/mnt` when sharing is enabled: read-only for Encrypted and
-Read-only, writable only for Read & write. Live folder mounts are FUSE views
-under that zone, read-only unless the user explicitly allows changes. The
+`/home/desktop/mnt` when sharing is enabled. The parent bind stays read-only;
+in Read & write, an explicitly writable folder gets its own writable FUSE
+submount. Other live folder mounts remain read-only. The
 container cannot name a host path to mount; that choice belongs to the native
 viewer. If the host runtime mount cannot propagate later FUSE mounts, the
 desktop still starts without live sharing.
+The drop-zone backing directory is traversable but not writable by
+the container. Its read-only bind prevents `..` and chmod from changing
+the backing directory, while the viewer can still add and remove FUSE mount
+points on the host. Writable `dirfs` shares map new
+files to the host owner and strip executable bits. Its root-anchored path
+lookup refuses symlink escapes.
 The native File menu alone opens GTK pickers for host paths; the webview has no
 path-accepting mount command. Menu items reflect the current tier and runtime
 availability. ZIPs use the same decrypt-on-read FUSE view as startup mounts,
 and the Encrypted tier checks every file entry before mounting. Unmount releases
 the live FUSE mount, while Quit follows the window-close cleanup path.
+The File sharing tier is a launch-time bind ceiling: Off has no drop-zone bind;
+Encrypted and Read-only bind it read-only; Read & write also keeps the parent
+read-only but permits writable FUSE children. Each folder defaults to
+read-only. Tightening the tier rejects new mounts at
+once, and switching to Off unmounts current shares. Widening needs a new
+session. Explicitly remembered shares persist as paths only in a mode-0600
+config file. They appear inactive under Recent and encrypted ZIPs prompt again.
 
 The native WebKitGTK shell loads only the local viewer UI and uses an
 off-the-record request context. Chromium inside the desktop container keeps its

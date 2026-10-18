@@ -655,7 +655,9 @@ fn drop_zone_bind(tier: SharingTier, point: &Path) -> Option<BindMount<'_>> {
   (tier != SharingTier::Off).then_some(BindMount {
     source: point,
     target: "/home/desktop/mnt",
-    read_only: tier != SharingTier::Rw,
+    // The parent stays read-only even for RW: propagated FUSE children carry
+    // their own mount flags. This keeps `..` and chmod off the backing dir.
+    read_only: true,
   })
 }
 
@@ -1236,7 +1238,7 @@ mod tests {
       let bind = &value["services"]["desktop"]["volumes"][0];
       assert_eq!(bind["source"], point.to_str().unwrap());
       assert_eq!(bind["target"], "/home/desktop/mnt");
-      assert_eq!(bind["read_only"], tier != SharingTier::Rw);
+      assert_eq!(bind["read_only"], true);
       assert_eq!(bind["bind"]["propagation"], "rslave");
       assert_eq!(bind["bind"]["create_host_path"], false);
     }
