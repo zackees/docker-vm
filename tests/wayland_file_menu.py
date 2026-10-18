@@ -185,6 +185,16 @@ def main() -> None:
             "run this test under dbus-run-session, away from the user's KWin bus")
     os.environ["XDG_RUNTIME_DIR"] = str(args.workdir.resolve())
     lab = WaylandLab(args.viewer.resolve(), args.workdir.resolve(), args.display)
+    # The private bus was started before Python changed XDG_RUNTIME_DIR. Its
+    # activated GTK/portal helpers must inherit this same isolated environment,
+    # otherwise their accessibility sockets can replace the host's bus socket.
+    activation = {"XDG_RUNTIME_DIR": str(lab.workdir), "XDG_CONFIG_HOME": str(lab.workdir / "service-config"),
+                  "XDG_DATA_HOME": str(lab.workdir / "service-data"), "XDG_CACHE_HOME": str(lab.workdir / "service-cache"),
+                  "WAYLAND_DISPLAY": lab.socket, "DISPLAY": lab.display, "GDK_BACKEND": "wayland",
+                  "GSETTINGS_BACKEND": "memory", "NO_AT_BRIDGE": "1"}
+    os.environ.update(activation)
+    result = command("dbus-update-activation-environment", *activation)
+    require(result.returncode == 0, f"could not isolate D-Bus service activation: {result.stderr}")
     try:
         lab.start_display()
         exercise(lab)
