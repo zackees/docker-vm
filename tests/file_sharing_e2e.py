@@ -149,7 +149,8 @@ class Lab:
 
     @property
     def env(self) -> dict[str, str]:
-        return {**os.environ, "DISPLAY": self.display, "GDK_BACKEND": "x11", "WAYLAND_DISPLAY": ""}
+        return {**os.environ, "DISPLAY": self.display, "GDK_BACKEND": "x11", "WAYLAND_DISPLAY": "",
+                "GSETTINGS_BACKEND": "memory"}
 
     def start_display(self) -> None:
         log = (self.workdir / "xvfb.log").open("wb")
@@ -194,7 +195,8 @@ class Lab:
             settings_dir.mkdir(exist_ok=True)
             (settings_dir / "settings.json").write_text(json.dumps({"file_sharing": saved}))
         log = self.workdir / f"{label}.log"
-        env = {**self.env, "XDG_CONFIG_HOME": str(config)}
+        env = {**self.env, "XDG_CONFIG_HOME": str(config),
+               "XDG_DATA_HOME": str(config / "data"), "XDG_CACHE_HOME": str(config / "cache")}
         if not gpu:
             env["DOCKER_VM_GPU"] = "off"
         else:
@@ -262,42 +264,71 @@ class Lab:
         name = "Mount Folder" if folder else "Mount ZIP Archive"
 
         def window() -> bool:
-            return bool(command("xdotool", "search", "--name", name, env=self.env).stdout.strip())
+            return bool(command("xdotool", "search", "--onlyvisible", "--name", name, env=self.env).stdout.strip())
 
         if not window():
             self.click(205, y)  # GTK may first select a menu row on bare Xvfb.
         until(window, f"native {name} picker did not appear", 5)
-        ids = command("xdotool", "search", "--name", name, env=self.env).stdout.split()
+        ids = command("xdotool", "search", "--onlyvisible", "--name", name, env=self.env).stdout.split()
         identity = ids[-1]
-        self.xdo("windowsize", identity, "900", "600")
-        self.xdo("windowmove", identity, "100", "80")
+        self.xdo("windowsize", "--sync", identity, "900", "600")
+        time.sleep(0.2)  # Allow GTK to center the resized native window.
         return int(identity)
 
     def choose(self, path: Path, *, folder: bool, tier: str, remember: bool = False,
                writable: bool = False) -> float:
         identity = self.picker(folder, tier)
+        x, y, width, height = self.geometry(str(identity))
         if remember:
             self.screenshot("remember-picker-before")
-            self.click(118, 618)
+            self.click(x + 18, y + height - 62)
             self.screenshot("remember-picker-after")
-        self.click(145, 140)  # Home, leaving the Recent view.
+        self.click(x + 45, y + 60)  # Home, leaving the Recent view.
         self.key("ctrl+l")
         self.xdo("windowfocus", "--sync", str(identity))
         self.key("ctrl+a", "BackSpace")
         self.type(str(path))
+        mounted_at = time.monotonic()
         self.key("Return")
         if folder:
             time.sleep(0.2)
-            if command("xdotool", "search", "--name", "Mount Folder", env=self.env).stdout.strip():
-                self.click(950, 656)
+            if command("xdotool", "search", "--onlyvisible", "--name", "Mount Folder", env=self.env).stdout.strip():
+                x, y, width, height = self.geometry(str(identity))
+                mounted_at = time.monotonic()
+                self.click(x + width - 50, y + height - 24)
         if folder and tier == "rw":
-            time.sleep(0.2)
+            until(lambda: bool(self.message_dialog()), "Allow changes confirmation did not appear", 5)
             self.screenshot("rw-confirm-before")
-            self.click(730 if writable else 545, 423)
-        return time.monotonic()
+            x, y, width, height = self.geometry(self.message_dialog())
+            mounted_at = time.monotonic()
+            self.click(x + (3 * width // 4 if writable else width // 4), y + height - 18)
+        return mounted_at
+
+    def geometry(self, identity: str) -> tuple[int, int, int, int]:
+        value = self.xdo("getwindowgeometry", "--shell", identity).stdout
+        return tuple(int(re.search(rf"^{key}=(-?\d+)$", value, re.MULTILINE).group(1))
+                     for key in ("X", "Y", "WIDTH", "HEIGHT"))
+
+    def message_dialog(self) -> str:
+        ids = command("xdotool", "search", "--onlyvisible", "--pid",
+                      str(self.sessions[-1].process.pid), env=self.env).stdout.split()
+        for identity in ids:
+            name = command("xdotool", "getwindowname", identity, env=self.env)
+            if name.returncode == 0 and not name.stdout.strip():
+                return identity
+        return ""
 
     def dismiss(self) -> None:
-        self.click(640, 423)
+        # A mount becomes visible before its worker's success dialog is mapped.
+        # Wait for the actual dialog instead of clicking its future position.
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            identity = self.message_dialog()
+            if identity:
+                x, y, width, height = self.geometry(identity)
+                self.click(x + width // 2, y + height - 18)
+                return
+            time.sleep(0.05)
 
     def password(self, title: str, value: str) -> None:
         def focus() -> bool:

@@ -217,7 +217,12 @@ function quietRfb(RFB, active) {
   const messages = RFB.messages;
   const request = messages.fbUpdateRequest;
   const continuous = messages.enableContinuousUpdates;
-  messages.fbUpdateRequest = (...args) => { if (!active()) request(...args); };
+  // A pending update is also how the server delivers desktop-size/control
+  // rectangles. Dropping all requests leaves noVNC's pointer dimensions stale
+  // after a resize even though the native video already shows the new size.
+  messages.fbUpdateRequest = (sock, incremental, ...rectangle) => active()
+    ? request(sock, true, 0, 0, 1, 1)
+    : request(sock, incremental, ...rectangle);
   messages.enableContinuousUpdates = (sock, enable, x, y, w, h) =>
     continuous(sock, active() ? false : enable, x, y, w, h);
   return () => { messages.fbUpdateRequest = request; messages.enableContinuousUpdates = continuous; };
@@ -264,6 +269,7 @@ export async function startNativeVideo(RFB, rfb, invoke, onStop = () => {}, onFr
         live = true;
         place();
         rfb._updateContinuousUpdates();
+        RFB.messages.fbUpdateRequest(rfb._sock, true, 0, 0, 1, 1);
       }
     } else if (state.state === 'failed' || state.state === 'off') {
       stop(state.reason ?? state.state);
@@ -313,6 +319,7 @@ export async function startVideo(RFB, rfb, { video_url: url, video_capability: c
             live = true;
             // Re-issue the standing update request at one pixel.
             rfb._updateContinuousUpdates();
+            RFB.messages.fbUpdateRequest(rfb._sock, true, 0, 0, 1, 1);
           }
         } catch (error) {
           stop(`present: ${error.message}`);
