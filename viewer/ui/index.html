@@ -34,7 +34,16 @@
         <label><input type="radio" name="video" value="off"> VNC only</label>
         <p class="unavailable" hidden></p>
       </fieldset>
-      <p id="settings-note">Changes apply to the next session.</p>
+      <fieldset id="file-sharing-setting">
+        <legend>File sharing</legend>
+        <label><input type="radio" name="file-sharing" value="off"> Off — no host files shared</label>
+        <label><input type="radio" name="file-sharing" value="encrypted"> Encrypted archives only — password-protected zips</label>
+        <label><input type="radio" name="file-sharing" value="ro"> Read-only — folders and archives</label>
+        <label><input type="radio" name="file-sharing" value="rw"> Read &amp; write — allow changes per folder</label>
+      </fieldset>
+      <p id="file-sharing-running"></p>
+      <p id="file-sharing-note">Turning sharing on or allowing changes takes effect after Restart session; turning it down applies now.</p>
+      <p id="settings-note">GPU, desktop and video changes apply to the next session.</p>
       <p id="settings-overrides" hidden></p>
       <button id="settings-restart" type="button">Restart session</button>
     </section>

@@ -20,7 +20,7 @@ use tokio_tungstenite::{accept_hdr_async, tungstenite::{handshake::server::{Requ
 use uuid::Uuid;
 
 use crate::{
-  settings::{self, HostSupport, Mode, Settings, SettingsView},
+  settings::{self, HostSupport, Mode, Settings, SettingsView, SharingTier},
   mounts::{Options, ZipMount},
   zipfs::{self, Archive, Password, ZipFs},
 };
@@ -67,6 +67,7 @@ pub struct SessionManager {
   // Choices this session started with, and what the host supports (filled in
   // by the worker before any Docker work).
   settings: Settings,
+  file_sharing: SharingTier,
   host: Mutex<Option<HostSupport>>,
   // RFB bytes forwarded to the viewer; read only by `DOCKER_VM_STATS` reports.
   bridged_bytes: Arc<AtomicU64>,
@@ -146,6 +147,7 @@ impl SessionManager {
   /// Prepares the private session directory and returns immediately; Docker
   /// work (image build, container start, VNC wait) runs on a worker thread.
   pub fn start(mounts: Vec<PreparedMount>, settings: Settings) -> Result<Arc<Self>, String> {
+    let file_sharing = SharingTier::effective(settings.file_sharing);
     let runtime = runtime_dir()?;
     ensure_tmpfs(&runtime)?;
     let project = format!("docker-vm-{}", Uuid::new_v4().simple());
@@ -164,7 +166,7 @@ impl SessionManager {
     let manager = Arc::new(Self {
       root, project, overrides: Mutex::new(overrides), mounts_dir, mount_points,
       archive_mounts: Mutex::new(Vec::new()), progress, startup: Mutex::new(None), shutdown: Mutex::new(Vec::new()), video: AtomicBool::new(false), video_address: Mutex::new(None), audio_address: Mutex::new(None),
-      settings, host: Mutex::new(None),
+      settings, file_sharing, host: Mutex::new(None),
       bridged_bytes: Arc::new(AtomicU64::new(0)),
     });
     let password = secret(24)?;
@@ -269,7 +271,7 @@ impl SessionManager {
   /// host supports, for the settings panel.
   pub fn settings_view(&self) -> SettingsView {
     let host = self.host.lock().ok().and_then(|host| host.clone());
-    SettingsView::new(settings::load(), host.as_ref())
+    SettingsView::new(settings::load(), self.file_sharing, host.as_ref())
   }
 
   fn overrides(&self) -> Vec<PathBuf> {

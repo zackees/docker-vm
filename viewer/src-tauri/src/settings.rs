@@ -1,7 +1,7 @@
 //! Viewer settings: GPU rendering, the Wayland GPU desktop and the hardware
 //! video transport.
 //!
-//! Persisted as three choices in `$XDG_CONFIG_HOME/docker-vm/settings.json`
+//! Persisted in `$XDG_CONFIG_HOME/docker-vm/settings.json`
 //! (default `~/.config`); nothing about sessions is ever written. Settings take
 //! effect when a session starts. `DOCKER_VM_GPU=off`, `DOCKER_VM_WAYLAND=off`
 //! and `DOCKER_VM_VIDEO=off` still override them for one launch.
@@ -20,12 +20,32 @@ pub enum Mode {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SharingTier {
+  Off,
+  Encrypted,
+  #[default]
+  Ro,
+  Rw,
+}
+
+impl SharingTier {
+  pub fn effective(saved: Self) -> Self {
+    std::env::var("DOCKER_VM_FILE_SHARING").ok()
+      .and_then(|value| serde_json::from_value::<Self>(serde_json::Value::String(value)).ok())
+      .unwrap_or(saved)
+  }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
   pub gpu: Mode,
   /// The Wayland GPU desktop (with audio); off = the classic X desktop.
   pub wayland: Mode,
   pub video: Mode,
+  #[serde(default)]
+  pub file_sharing: SharingTier,
 }
 
 /// Whether this host can do GPU rendering at all, and if not, why.
@@ -49,6 +69,8 @@ impl HostSupport {
 #[derive(Clone, Debug, Serialize)]
 pub struct SettingsView {
   pub settings: Settings,
+  /// The tier fixed when this session started. The saved choice may differ.
+  pub effective_file_sharing: SharingTier,
   /// `None` while the host is still being checked.
   pub gpu_unavailable: Option<String>,
   pub wayland_unavailable: Option<String>,
@@ -58,15 +80,20 @@ pub struct SettingsView {
 }
 
 impl SettingsView {
-  pub fn new(settings: Settings, host: Option<&HostSupport>) -> Self {
+  pub fn new(settings: Settings, effective_file_sharing: SharingTier, host: Option<&HostSupport>) -> Self {
     let gpu_unavailable = host.and_then(|host| host.device().err().map(str::to_string));
     let video_unavailable = gpu_unavailable.clone().map(|reason| format!("needs GPU rendering: {reason}"));
     let wayland_unavailable = video_unavailable.clone();
-    let overrides = ["DOCKER_VM_GPU", "DOCKER_VM_WAYLAND", "DOCKER_VM_VIDEO"].into_iter()
+    let mut overrides: Vec<String> = ["DOCKER_VM_GPU", "DOCKER_VM_WAYLAND", "DOCKER_VM_VIDEO"].into_iter()
       .filter(|name| env_off(name))
       .map(|name| format!("{name}=off"))
       .collect();
-    Self { settings, gpu_unavailable, wayland_unavailable, video_unavailable, checking: host.is_none(), overrides }
+    if let Ok(value) = std::env::var("DOCKER_VM_FILE_SHARING") {
+      if serde_json::from_value::<SharingTier>(serde_json::Value::String(value.clone())).is_ok() {
+        overrides.push(format!("DOCKER_VM_FILE_SHARING={value}"));
+      }
+    }
+    Self { settings, effective_file_sharing, gpu_unavailable, wayland_unavailable, video_unavailable, checking: host.is_none(), overrides }
   }
 }
 
@@ -80,7 +107,7 @@ fn path() -> Option<PathBuf> {
   Some(base.join("docker-vm").join("settings.json"))
 }
 
-/// Missing or unreadable settings are the defaults (all Auto).
+/// Missing or unreadable settings use the defaults (Auto and Read-only).
 pub fn load() -> Settings {
   path().and_then(|path| fs::read(path).ok())
     .and_then(|bytes| serde_json::from_slice(&bytes).ok())
@@ -104,21 +131,24 @@ mod tests {
   use super::*;
 
   #[test]
-  fn settings_default_to_auto_and_tolerate_missing_fields() {
-    assert_eq!(Settings::default(), Settings { gpu: Mode::Auto, wayland: Mode::Auto, video: Mode::Auto });
+  fn settings_default_to_read_only_sharing_and_tolerate_missing_fields() {
+    assert_eq!(Settings::default(), Settings { gpu: Mode::Auto, wayland: Mode::Auto, video: Mode::Auto, file_sharing: SharingTier::Ro });
     let partial: Settings = serde_json::from_str(r#"{"video":"off"}"#).unwrap();
-    assert_eq!(partial, Settings { gpu: Mode::Auto, wayland: Mode::Auto, video: Mode::Off });
+    assert_eq!(partial, Settings { gpu: Mode::Auto, wayland: Mode::Auto, video: Mode::Off, file_sharing: SharingTier::Ro });
+    let writable: Settings = serde_json::from_str(r#"{"file_sharing":"rw"}"#).unwrap();
+    assert_eq!(writable.file_sharing, SharingTier::Rw);
+    assert_eq!(serde_json::to_value(writable).unwrap()["file_sharing"], "rw");
   }
 
   #[test]
   fn missing_kvm_or_gpu_greys_out_both_settings_with_the_reason() {
     let no_kvm = HostSupport { kvm: Err("KVM is not enabled".into()), gpu: Ok("nvidia.com/gpu=0".into()) };
-    let view = SettingsView::new(Settings::default(), Some(&no_kvm));
+    let view = SettingsView::new(Settings::default(), SharingTier::Ro, Some(&no_kvm));
     assert_eq!(view.gpu_unavailable.as_deref(), Some("KVM is not enabled"));
     assert_eq!(view.video_unavailable.as_deref(), Some("needs GPU rendering: KVM is not enabled"));
     let ready = HostSupport { kvm: Ok(()), gpu: Ok("nvidia.com/gpu=0".into()) };
-    let view = SettingsView::new(Settings::default(), Some(&ready));
+    let view = SettingsView::new(Settings::default(), SharingTier::Ro, Some(&ready));
     assert_eq!((view.gpu_unavailable, view.video_unavailable, view.checking), (None, None, false));
-    assert!(SettingsView::new(Settings::default(), None).checking);
+    assert!(SettingsView::new(Settings::default(), SharingTier::Ro, None).checking);
   }
 }
