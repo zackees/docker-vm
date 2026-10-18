@@ -1,9 +1,53 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { codecFromAccessUnit, FrameReader } from '../viewer/ui/video.mjs';
+import { codecFromAccessUnit, FrameReader, startNativeVideo } from '../viewer/ui/video.mjs';
 
 const sps = [0, 0, 0, 1, 0x67, 0x64, 0x00, 0x33, 0xac, 0x2b];
 const idr = [0, 0, 1, 0x65, 0x88, 0x84];
+
+test('native video keeps a small RFB request pending for resize acknowledgements', async () => {
+  const saved = { ResizeObserver: globalThis.ResizeObserver, window: globalThis.window,
+    setInterval: globalThis.setInterval, clearInterval: globalThis.clearInterval };
+  let poll;
+  let disconnect;
+  const requests = [];
+  const continuous = [];
+  const sock = {};
+  const RFB = { messages: {
+    fbUpdateRequest: (...args) => requests.push(args),
+    enableContinuousUpdates: (...args) => continuous.push(args),
+  } };
+  const rfb = {
+    _sock: sock, _fbWidth: 1280, _fbHeight: 800,
+    _canvas: { getBoundingClientRect: () => ({ left: 0, top: 0, width: 1280, height: 800 }) },
+    _updateContinuousUpdates: () => RFB.messages.enableContinuousUpdates(sock, true, 0, 0, 1280, 800),
+    addEventListener: (_, callback) => { disconnect = callback; },
+  };
+  try {
+    globalThis.ResizeObserver = class { observe() {} disconnect() {} };
+    globalThis.window = { addEventListener() {}, removeEventListener() {} };
+    globalThis.setInterval = callback => { poll = callback; return 1; };
+    globalThis.clearInterval = () => {};
+    const invoke = async command => command === 'native_video_start' ? true
+      : command === 'native_video_state' ? { state: 'live', frames: 1 } : undefined;
+    assert.equal(await startNativeVideo(RFB, rfb, invoke), true);
+    await poll();
+    assert.equal(continuous.at(-1)[1], false, 'full-frame continuous updates should be disabled');
+    assert.deepEqual(requests.at(-1), [sock, true, 0, 0, 1, 1],
+      'the server still needs a pending request to deliver resize/control rectangles');
+    // noVNC requests the next update after processing a framebuffer response.
+    RFB.messages.fbUpdateRequest(sock, true, 0, 0, 1920, 1080);
+    assert.deepEqual(requests.at(-1), [sock, true, 0, 0, 1, 1]);
+    disconnect();
+    assert.deepEqual(requests.at(-1), [sock, false, 0, 0, 1280, 800],
+      'stopping native video must restore the full RFB framebuffer');
+  } finally {
+    for (const [name, value] of Object.entries(saved)) {
+      if (value === undefined) delete globalThis[name];
+      else globalThis[name] = value;
+    }
+  }
+});
 
 test('codec string comes from the SPS profile, constraints and level', () => {
   assert.equal(codecFromAccessUnit(Uint8Array.from([...sps, ...idr])), 'avc1.640033');

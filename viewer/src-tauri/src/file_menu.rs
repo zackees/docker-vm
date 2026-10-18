@@ -1,7 +1,7 @@
 //! Native File menu. Paths enter only through GTK's host picker; the webview
 //! has no command that accepts a source path.
 
-use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::Arc, time::Duration};
+use std::{cell::{Cell, RefCell}, path::PathBuf, rc::Rc, sync::{Arc, atomic::{AtomicBool, Ordering}}, time::Duration};
 
 use gtk::prelude::*;
 use tauri::{Manager, menu::{Menu, MenuItem, Submenu}};
@@ -34,6 +34,7 @@ pub fn install(app: tauri::AppHandle, window: tauri::WebviewWindow, manager: Arc
     gtk::glib::ControlFlow::Continue
   });
 
+  let picking = Arc::new(AtomicBool::new(false));
   window.on_menu_event(move |_, event| {
     let id = event.id().0.as_str();
     if id == QUIT { app.exit(0); return; }
@@ -64,26 +65,53 @@ pub fn install(app: tauri::AppHandle, window: tauri::WebviewWindow, manager: Arc
       return;
     }
     if id != MOUNT_FOLDER && id != MOUNT_ARCHIVE { return; }
-    let Some(window) = app.get_webview_window("main") else { return; };
     let folder = id == MOUNT_FOLDER;
     let status = manager.sharing_status();
     if status.unavailable.is_some() || status.allowed_now == SharingTier::Off { return; }
     if folder && status.allowed_now == SharingTier::Encrypted { return; }
-    let Some((source, remember)) = pick(&window, folder) else { return; };
-    let writable = folder && status.allowed_now == SharingTier::Rw && allow_changes(&window);
+    if picking.swap(true, Ordering::AcqRel) { return; }
     let manager = Arc::clone(&manager);
     let app = app.clone();
-    std::thread::spawn(move || {
-      let saved = SavedShare { source: source.clone(), kind: if folder { Kind::Folder } else { Kind::Zip }, allow_changes: writable };
-      let result = if folder { manager.mount_folder_live(source, writable) } else { manager.mount_archive_live(source) }
-        .map(|name| {
-          let message = format!("Mounted {name} at ~/mnt/{name}");
-          if remember { shares::remember(saved).map(|()| message) } else { Ok(message) }
-        }).and_then(|result| result);
-      report(&app, result);
+    let picking = Arc::clone(&picking);
+    // Let GTK finish dismissing the native menu before presenting another
+    // surface. Modal dialogs use response signals, never a nested event loop.
+    gtk::glib::idle_add_once(move || {
+      let Some(window) = app.get_webview_window("main") else {
+        picking.store(false, Ordering::Release);
+        return;
+      };
+      let confirm_window = window.clone();
+      pick(&window, folder, move |selected| {
+        let Some((source, remember)) = selected else {
+          picking.store(false, Ordering::Release);
+          return;
+        };
+        let mount = move |writable| {
+          picking.store(false, Ordering::Release);
+          mount_selected(app, manager, source, folder, remember, writable);
+        };
+        if folder && status.allowed_now == SharingTier::Rw {
+          allow_changes(&confirm_window, mount);
+        } else {
+          mount(false);
+        }
+      });
     });
   });
   Ok(())
+}
+
+fn mount_selected(app: tauri::AppHandle, manager: Arc<SessionManager>, source: PathBuf,
+                  folder: bool, remember: bool, writable: bool) {
+  std::thread::spawn(move || {
+    let saved = SavedShare { source: source.clone(), kind: if folder { Kind::Folder } else { Kind::Zip }, allow_changes: writable };
+    let result = if folder { manager.mount_folder_live(source, writable) } else { manager.mount_archive_live(source) }
+      .and_then(|name| {
+        if remember { shares::remember(saved)?; }
+        Ok(format!("Mounted {name} at ~/mnt/{name}"))
+      });
+    report(&app, result);
+  });
 }
 
 fn mount_saved(manager: &SessionManager, share: SavedShare) -> Result<String, String> {
@@ -138,11 +166,28 @@ fn build(app: &tauri::AppHandle, window: &tauri::WebviewWindow, status: &Sharing
   Ok(())
 }
 
-fn pick(window: &tauri::WebviewWindow, folder: bool) -> Option<(PathBuf, bool)> {
-  let parent = window.gtk_window().ok()?;
+fn pick(window: &tauri::WebviewWindow, folder: bool, done: impl FnOnce(Option<(PathBuf, bool)>) + 'static) {
+  let Ok(parent) = window.gtk_window() else { done(None); return; };
   let title = if folder { "Mount Folder" } else { "Mount ZIP Archive" };
   let action = if folder { gtk::FileChooserAction::SelectFolder } else { gtk::FileChooserAction::Open };
   let dialog = gtk::FileChooserDialog::new(Some(title), Some(&parent), action);
+  dialog.set_modal(true);
+  dialog.set_destroy_with_parent(true);
+  dialog.set_position(gtk::WindowPosition::CenterOnParent);
+  // GTK restores chooser geometry independently of the viewer. Override it
+  // after mapping so a saved size cannot hide the modal picker off-screen.
+  let width = (parent.allocated_width() - 80).clamp(640, 900);
+  let height = (parent.allocated_height() - 80).clamp(400, 600);
+  let max_width = parent.allocated_width();
+  let max_height = parent.allocated_height();
+  dialog.set_default_size(width, height);
+  dialog.connect_map(move |dialog| dialog.resize(width, height));
+  dialog.connect_size_allocate(move |dialog, allocation| {
+    // The chooser can restore its saved size from an idle callback after map.
+    if allocation.width() > max_width || allocation.height() > max_height {
+      dialog.resize(width, height);
+    }
+  });
   dialog.add_buttons(&[("Cancel", gtk::ResponseType::Cancel), ("Mount", gtk::ResponseType::Accept)]);
   let remember = gtk::CheckButton::with_label("Remember this share");
   dialog.set_extra_widget(&remember);
@@ -152,22 +197,34 @@ fn pick(window: &tauri::WebviewWindow, folder: bool) -> Option<(PathBuf, bool)> 
     filter.add_pattern("*.zip");
     dialog.add_filter(filter);
   }
-  let selected = (dialog.run() == gtk::ResponseType::Accept)
-    .then(|| dialog.filename().map(|source| (source, remember.is_active()))).flatten();
-  dialog.hide();
-  selected
+  let done = RefCell::new(Some(done));
+  dialog.connect_response(move |dialog, response| {
+    let Some(done) = done.borrow_mut().take() else { return; };
+    let selected = (response == gtk::ResponseType::Accept)
+      .then(|| dialog.filename().map(|source| (source, remember.is_active()))).flatten();
+    dialog.hide();
+    dialog.close();
+    done(selected);
+  });
+  dialog.present();
 }
 
-fn allow_changes(window: &tauri::WebviewWindow) -> bool {
-  let Ok(parent) = window.gtk_window() else { return false; };
+fn allow_changes(window: &tauri::WebviewWindow, done: impl FnOnce(bool) + 'static) {
+  let Ok(parent) = window.gtk_window() else { done(false); return; };
   let dialog = gtk::MessageDialog::new(Some(&parent), gtk::DialogFlags::MODAL,
     gtk::MessageType::Question, gtk::ButtonsType::None,
     "Allow the desktop to change files in this folder?");
   dialog.add_buttons(&[("Read-only", gtk::ResponseType::No), ("Allow changes", gtk::ResponseType::Yes)]);
   dialog.set_default_response(gtk::ResponseType::No);
-  let writable = dialog.run() == gtk::ResponseType::Yes;
-  dialog.hide();
-  writable
+  dialog.set_destroy_with_parent(true);
+  let done = RefCell::new(Some(done));
+  dialog.connect_response(move |dialog, response| {
+    let Some(done) = done.borrow_mut().take() else { return; };
+    dialog.hide();
+    dialog.close();
+    done(response == gtk::ResponseType::Yes);
+  });
+  dialog.present();
 }
 
 fn report(app: &tauri::AppHandle, result: Result<String, String>) {
@@ -180,7 +237,13 @@ fn report(app: &tauri::AppHandle, result: Result<String, String>) {
       Err(error) => (error, gtk::MessageType::Error),
     };
     let dialog = gtk::MessageDialog::new(Some(&parent), gtk::DialogFlags::MODAL, kind, gtk::ButtonsType::Ok, &message);
-    dialog.run();
-    dialog.hide();
+    dialog.set_destroy_with_parent(true);
+    let closed = Cell::new(false);
+    dialog.connect_response(move |dialog, _| {
+      if closed.replace(true) { return; }
+      dialog.hide();
+      dialog.close();
+    });
+    dialog.present();
   });
 }
