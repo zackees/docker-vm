@@ -109,6 +109,8 @@ pub struct Archive {
   file: Arc<File>,
   nodes: Vec<Node>,
   encrypted: Vec<usize>,
+  file_entries: usize,
+  encrypted_entries: usize,
 }
 
 impl Archive {
@@ -121,8 +123,16 @@ impl Archive {
     }
     let mut zip = ZipArchive::new(SharedFile { file: Arc::clone(&file), position: 0 }).map_err(|error| describe(&error))?;
     let (mut nodes, mut encrypted) = (vec![Node::directory(0)], Vec::new());
+    let (mut file_entries, mut encrypted_entries) = (0, 0);
     for index in 0..zip.len() {
       let entry = zip.by_index_raw(index).map_err(|error| describe(&error))?;
+      if !entry.is_dir() {
+        file_entries += 1;
+        if entry.encrypted() {
+          encrypted_entries += 1;
+          encrypted.push(index);
+        }
+      }
       // `enclosed_name` rejects absolute and escaping paths. Symlinks are hidden.
       let Some(name) = entry.enclosed_name().filter(|_| !entry.is_symlink()) else { continue };
       let parts: Vec<&OsStr> = name.components().filter_map(|part| match part { Component::Normal(part) => Some(part), _ => None }).collect();
@@ -134,9 +144,6 @@ impl Archive {
         size: entry.size(),
         direct: if entry.encrypted() || entry.compression() != CompressionMethod::Stored { None } else { entry.data_start() },
       });
-      if file.is_some() && entry.encrypted() {
-        encrypted.push(index);
-      }
       let Some(parent) = parents.iter().try_fold(0, |parent, part| child_directory(&mut nodes, parent, part)) else { continue };
       match file {
         None => {
@@ -154,10 +161,14 @@ impl Archive {
         }
       }
     }
-    Ok(Self { zip, file, nodes, encrypted })
+    Ok(Self { zip, file, nodes, encrypted, file_entries, encrypted_entries })
   }
 
   pub fn is_encrypted(&self) -> bool { !self.encrypted.is_empty() }
+
+  /// The Encrypted tier accepts only archives whose every file entry is encrypted.
+  /// Count raw entries, including paths hidden from the FUSE view.
+  pub fn all_encrypted(&self) -> bool { self.file_entries > 0 && self.file_entries == self.encrypted_entries }
 
   pub fn check_password(&mut self, password: &Password) -> Result<bool, String> {
     for &index in self.encrypted.iter().take(PASSWORD_SAMPLES) {
@@ -460,6 +471,25 @@ mod tests {
     zip.start_file("../escape.txt", stored()).unwrap();
     zip.write_all(b"outside\n").unwrap();
     zip.finish().unwrap().into_inner()
+  }
+
+  fn classified_fixture(encrypted: &[bool]) -> TempZip {
+    let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+    zip.add_directory("docs/", stored()).unwrap();
+    for (index, secret) in encrypted.iter().enumerate() {
+      let options = if *secret { stored().with_aes_encryption(AesMode::Aes256, PASSWORD) } else { stored() };
+      zip.start_file(format!("docs/file-{index}.txt"), options).unwrap();
+      zip.write_all(b"content").unwrap();
+    }
+    temp_zip(&zip.finish().unwrap().into_inner())
+  }
+
+  #[test]
+  fn classifies_all_file_entries_for_encrypted_tier() {
+    for (entries, expected) in [(&[true, true][..], true), (&[false, false], false), (&[true, false], false), (&[], false)] {
+      let zip = classified_fixture(entries);
+      assert_eq!(Archive::open(&zip.0).unwrap().all_encrypted(), expected);
+    }
   }
 
   fn names(fs: &ZipFs, index: usize) -> Vec<String> {
