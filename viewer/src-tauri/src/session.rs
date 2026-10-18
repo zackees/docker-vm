@@ -46,6 +46,26 @@ pub struct PreparedMount {
   password: Option<Password>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LiveKind { Folder, Archive, EncryptedArchive }
+
+struct LiveMount {
+  name: String,
+  source: PathBuf,
+  writable: bool,
+  kind: LiveKind,
+  session: BackgroundSession,
+}
+
+#[derive(Clone, Serialize)]
+pub struct SharingStatus {
+  pub effective: SharingTier,
+  pub allowed_now: SharingTier,
+  pub unavailable: Option<String>,
+  pub mounts: Vec<String>,
+}
+
 pub struct SessionManager {
   root: PathBuf,
   project: String,
@@ -55,6 +75,9 @@ pub struct SessionManager {
   mounts_dir: PathBuf,
   mount_points: Vec<PathBuf>,
   archive_mounts: Mutex<Vec<BackgroundSession>>,
+  live_mounts: Mutex<Vec<LiveMount>>,
+  sharing_unavailable: Mutex<Option<String>>,
+  drop_zone_ready: AtomicBool,
   progress: Arc<Progress>,
   startup: Mutex<Option<thread::JoinHandle<()>>>,
   shutdown: Mutex<Vec<watch::Sender<bool>>>,
@@ -68,6 +91,7 @@ pub struct SessionManager {
   // by the worker before any Docker work).
   settings: Settings,
   file_sharing: SharingTier,
+  sharing_ceiling: Mutex<SharingTier>,
   host: Mutex<Option<HostSupport>>,
   // RFB bytes forwarded to the viewer; read only by `DOCKER_VM_STATS` reports.
   bridged_bytes: Arc<AtomicU64>,
@@ -157,7 +181,7 @@ impl SessionManager {
     // Outside `root`, which the container already sees at /run/session.
     let mounts_dir = runtime.join(format!("{project}.mounts"));
     let mount_points: Vec<PathBuf> = (0..mounts.len()).map(|index| mounts_dir.join(index.to_string())).collect();
-    let overrides = if mounts.is_empty() { Vec::new() } else { vec![mounts_dir.join("compose.yaml")] };
+    let overrides = if mounts.is_empty() && file_sharing == SharingTier::Off { Vec::new() } else { vec![mounts_dir.join("compose.yaml")] };
     let progress = Arc::new(Progress {
       status: Mutex::new(Status::Starting { stage: "Preparing private session…".into(), log: Vec::new() }),
       child: Mutex::new(None),
@@ -165,8 +189,9 @@ impl SessionManager {
     });
     let manager = Arc::new(Self {
       root, project, overrides: Mutex::new(overrides), mounts_dir, mount_points,
-      archive_mounts: Mutex::new(Vec::new()), progress, startup: Mutex::new(None), shutdown: Mutex::new(Vec::new()), video: AtomicBool::new(false), video_address: Mutex::new(None), audio_address: Mutex::new(None),
-      settings, file_sharing, host: Mutex::new(None),
+      archive_mounts: Mutex::new(Vec::new()), live_mounts: Mutex::new(Vec::new()), sharing_unavailable: Mutex::new(None), drop_zone_ready: AtomicBool::new(false),
+      progress, startup: Mutex::new(None), shutdown: Mutex::new(Vec::new()), video: AtomicBool::new(false), video_address: Mutex::new(None), audio_address: Mutex::new(None),
+      settings, file_sharing, sharing_ceiling: Mutex::new(file_sharing), host: Mutex::new(None),
       bridged_bytes: Arc::new(AtomicU64::new(0)),
     });
     let password = secret(24)?;
@@ -190,14 +215,33 @@ impl SessionManager {
 
   fn launch(&self, mounts: Vec<PreparedMount>, password: String) -> Result<Connection, String> {
     let progress = &self.progress;
-    if !mounts.is_empty() {
-      ensure_mount_owner(&self.root)?;
-      ensure_propagating(self.mounts_dir.parent().ok_or("runtime directory missing")?)?;
+    let wants_live = self.file_sharing != SharingTier::Off;
+    let propagation = if mounts.is_empty() && !wants_live { Ok(()) } else {
+      ensure_mount_owner(&self.root).and_then(|_| ensure_propagating(self.mounts_dir.parent().ok_or("runtime directory missing")?))
+    };
+    if !mounts.is_empty() { propagation.clone()?; }
+    let overlap = mounts.iter().any(|mount| mount.target == "/home/desktop/mnt"
+      || mount.target.starts_with("/home/desktop/mnt/"));
+    let unavailable = live_unavailable(self.file_sharing, overlap, &propagation);
+    if let Some(reason) = &unavailable { eprintln!("live sharing unavailable: {reason}"); }
+    *self.sharing_unavailable.lock().map_err(|_| "sharing status lock unavailable")? = unavailable.clone();
+    let live = wants_live && unavailable.is_none();
+    if !mounts.is_empty() || live {
+      let live_point = self.mounts_dir.join("live");
       for directory in std::iter::once(&self.mounts_dir).chain(&self.mount_points) {
         create_private_dir(directory)?;
       }
-      let binds: Vec<(&Path, &str)> = self.mount_points.iter().map(PathBuf::as_path).zip(mounts.iter().map(|mount| mount.target.as_str())).collect();
+      let mut binds: Vec<BindMount<'_>> = self.mount_points.iter().map(PathBuf::as_path)
+        .zip(mounts.iter().map(|mount| mount.target.as_str()))
+        .map(|(source, target)| BindMount { source, target, read_only: true }).collect();
+      if live {
+        create_private_dir(&live_point)?;
+        binds.push(drop_zone_bind(self.file_sharing, &live_point).expect("live tier has a drop zone"));
+        self.drop_zone_ready.store(true, Ordering::Release);
+      }
       write_secret(&self.overrides()[0], mount_override(&binds)?.as_bytes())?;
+    } else {
+      self.overrides.lock().map_err(|_| "override lock unavailable")?.clear();
     }
     progress.stage("Checking for GPU acceleration…");
     let host = host_support();
@@ -272,6 +316,86 @@ impl SessionManager {
   pub fn settings_view(&self) -> SettingsView {
     let host = self.host.lock().ok().and_then(|host| host.clone());
     SettingsView::new(settings::load(), self.file_sharing, host.as_ref())
+  }
+
+  pub fn sharing_status(&self) -> SharingStatus {
+    let allowed_now = self.sharing_ceiling.lock().map(|tier| *tier).unwrap_or(SharingTier::Off);
+    let unavailable = if allowed_now == SharingTier::Off { None } else {
+      self.sharing_unavailable.lock().ok().and_then(|reason| reason.clone())
+        .or_else(|| (!self.drop_zone_ready.load(Ordering::Acquire))
+          .then(|| "the desktop session is still starting".into()))
+    };
+    SharingStatus {
+      effective: self.file_sharing,
+      allowed_now,
+      unavailable,
+      mounts: self.live_mounts.lock().map(|mounts| mounts.iter().map(|mount| mount.name.clone()).collect()).unwrap_or_default(),
+    }
+  }
+
+  /// Called after saving settings. Tightening to Off releases live mounts at
+  /// once; other tightening is checked for every later mount.
+  pub fn apply_sharing_tier(&self) -> Result<(), String> {
+    let tier = {
+      let mut ceiling = self.sharing_ceiling.lock().map_err(|_| "sharing limit lock unavailable")?;
+      let narrowed = (*ceiling).restrict(settings::load().file_sharing);
+      *ceiling = narrowed;
+      *ceiling
+    };
+    if tier == SharingTier::Off {
+      let errors = self.release_live_mounts();
+      if !errors.is_empty() { return Err(errors.join("; ")); }
+    }
+    Ok(())
+  }
+
+  /// Mount through a native-picker caller on a worker thread. Only the caller
+  /// supplies the filesystem implementation; no webview command accepts paths.
+  pub fn mount_live<F>(&self, source: PathBuf, kind: LiveKind, writable: bool, mount: F) -> Result<String, String>
+  where F: FnOnce(&Path, &Path) -> Result<BackgroundSession, String> {
+    if !self.drop_zone_ready.load(Ordering::Acquire) {
+      let reason = self.sharing_status().unavailable.unwrap_or_else(|| "file sharing is off for this session".into());
+      return Err(reason);
+    }
+    if self.progress.stopping() { return Err("session is stopping".into()); }
+    if !matches!(self.status(), Status::Ready { .. }) { return Err("desktop session is not ready".into()); }
+    let mut mounts = self.live_mounts.lock().map_err(|_| "live mount lock unavailable")?;
+    let tier = *self.sharing_ceiling.lock().map_err(|_| "sharing limit lock unavailable")?;
+    if !tier_allows(tier, kind, writable) { return Err(format!("file sharing tier {tier:?} does not allow this mount")); }
+    let source = source.canonicalize().map_err(|error| format!("open share source: {error}"))?;
+    let stem = sanitize_name(&source);
+    let existing: Vec<String> = fs::read_dir(self.mounts_dir.join("live"))
+      .map_err(|error| format!("list live mounts: {error}"))?
+      .filter_map(|entry| entry.ok().map(|entry| entry.file_name().to_string_lossy().into_owned())).collect();
+    let name = unique_name(&stem, existing.iter().map(String::as_str).chain(mounts.iter().map(|mount| mount.name.as_str())));
+    let point = self.mounts_dir.join("live").join(&name);
+    create_private_dir(&point)?;
+    let session = match mount(&source, &point) {
+      Ok(session) => session,
+      Err(error) => { let _ = fs::remove_dir(&point); return Err(error); }
+    };
+    mounts.push(LiveMount { name: name.clone(), source, writable, kind, session });
+    Ok(name)
+  }
+
+  pub fn unmount_live(&self, name: &str) -> Result<(), String> {
+    let mut mounts = self.live_mounts.lock().map_err(|_| "live mount lock unavailable")?;
+    let index = mounts.iter().position(|mount| mount.name == name).ok_or("share is not mounted")?;
+    let point = self.mounts_dir.join("live").join(name);
+    let helper = if Path::new("/run/wrappers/bin/fusermount3").exists() { "/run/wrappers/bin/fusermount3" } else { "fusermount3" };
+    let output = Command::new(helper).arg("-u").arg(&point).output().map_err(|error| format!("unmount {name}: {error}"))?;
+    if !output.status.success() {
+      let detail = String::from_utf8_lossy(&output.stderr);
+      if detail.to_lowercase().contains("busy") { return Err(format!("{name} is in use; close files and retry")); }
+      return Err(format!("unmount {name}: {}", detail.trim()));
+    }
+    drop(mounts.remove(index));
+    fs::remove_dir(&point).map_err(|error| format!("remove mount point {name}: {error}"))
+  }
+
+  fn release_live_mounts(&self) -> Vec<String> {
+    let names: Vec<String> = self.live_mounts.lock().map(|mounts| mounts.iter().map(|mount| mount.name.clone()).collect()).unwrap_or_default();
+    names.into_iter().filter_map(|name| self.unmount_live(&name).err()).collect()
   }
 
   fn overrides(&self) -> Vec<PathBuf> {
@@ -366,10 +490,13 @@ impl SessionManager {
     // container after `down`.
     let handle = self.startup.lock().ok().and_then(|mut handle| handle.take());
     if let Some(handle) = handle && handle.thread().id() != thread::current().id() { let _ = handle.join(); }
+    for error in self.release_live_mounts() { eprintln!("live share cleanup: {error}"); }
     // RAM-only session: nothing to flush, so skip Docker's 10 s stop grace.
     if first {
       let _ = compose(&self.project, &self.root, &self.overrides(), "down", &["--remove-orphans", "--timeout", "0"]);
     }
+    for error in self.release_live_mounts() { eprintln!("live share cleanup after container stop: {error}"); }
+    let _ = fs::remove_dir(self.mounts_dir.join("live"));
     // Archives stay mounted until the container is gone.
     release_archives(&self.archive_mounts, &self.mounts_dir, &self.mount_points, &self.overrides());
     // Do not remove a non-tmpfs path. `start` only creates this after tmpfs
@@ -457,15 +584,63 @@ fn create_private_dir(path: &Path) -> Result<(), String> {
   fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|error| error.to_string())
 }
 
-/// Compose override binding each empty mount point read-only at its target.
+fn tier_allows(tier: SharingTier, kind: LiveKind, writable: bool) -> bool {
+  match tier {
+    SharingTier::Off => false,
+    SharingTier::Encrypted => kind == LiveKind::EncryptedArchive && !writable,
+    SharingTier::Ro => !writable,
+    SharingTier::Rw => !writable || kind == LiveKind::Folder,
+  }
+}
+
+fn live_unavailable(tier: SharingTier, overlap: bool, propagation: &Result<(), String>) -> Option<String> {
+  if tier == SharingTier::Off { None }
+  else if overlap { Some("a startup archive already uses ~/mnt".into()) }
+  else { propagation.as_ref().err().cloned() }
+}
+
+fn sanitize_name(source: &Path) -> String {
+  let name = source.file_name().map(|name| name.to_string_lossy()).unwrap_or_default();
+  let name: String = name.chars().map(|char| {
+    if char.is_ascii_alphanumeric() || "._-+@".contains(char) { char } else { '_' }
+  }).take(240).collect();
+  if name.is_empty() || matches!(name.as_str(), "." | "..") { "share".into() } else { name }
+}
+
+fn unique_name<'a>(stem: &str, existing: impl Iterator<Item = &'a str>) -> String {
+  let existing: std::collections::HashSet<&str> = existing.collect();
+  if !existing.contains(stem) { return stem.into(); }
+  for suffix in 2.. {
+    let name = format!("{stem}-{suffix}");
+    if !existing.contains(name.as_str()) { return name; }
+  }
+  unreachable!()
+}
+
+struct BindMount<'a> {
+  source: &'a Path,
+  target: &'a str,
+  read_only: bool,
+}
+
+fn drop_zone_bind(tier: SharingTier, point: &Path) -> Option<BindMount<'_>> {
+  (tier != SharingTier::Off).then_some(BindMount {
+    source: point,
+    target: "/home/desktop/mnt",
+    read_only: tier != SharingTier::Rw,
+  })
+}
+
+/// Compose override binding each empty mount point at its target.
 /// JSON is valid YAML, so values need JSON escaping plus Compose's `$$`.
-fn mount_override(binds: &[(&Path, &str)]) -> Result<String, String> {
-  let volumes = binds.iter().map(|(source, target)| -> Result<String, String> {
-    let source = source.to_str().ok_or("session runtime path is not valid UTF-8")?;
+fn mount_override(binds: &[BindMount<'_>]) -> Result<String, String> {
+  let volumes = binds.iter().map(|bind| -> Result<String, String> {
+    let source = bind.source.to_str().ok_or("session runtime path is not valid UTF-8")?;
     Ok(format!(
-      r#"{{"type":"bind","source":{},"target":{},"read_only":true,"bind":{{"propagation":"rslave","create_host_path":false}}}}"#,
+      r#"{{"type":"bind","source":{},"target":{},"read_only":{},"bind":{{"propagation":"rslave","create_host_path":false}}}}"#,
       compose_string(source),
-      compose_string(target),
+      compose_string(bind.target),
+      bind.read_only,
     ))
   }).collect::<Result<Vec<_>, _>>()?;
   Ok(format!(r#"{{"services":{{"desktop":{{"volumes":[{}]}}}}}}"#, volumes.join(",")))
@@ -719,7 +894,7 @@ fn ensure_tmpfs(path: &Path) -> Result<(), String> {
 fn ensure_propagating(path: &Path) -> Result<(), String> {
   match mount_info(path)? {
     (_, mount) if mount.propagates => Ok(()),
-    (canonical, mount) => Err(format!("{canonical:?} is on a private mount at {:?}; archive mounts need shared propagation", mount.target)),
+    (canonical, mount) => Err(format!("{canonical:?} is on a private mount at {:?}; live and archive mounts need shared propagation", mount.target)),
   }
 }
 
@@ -1016,10 +1191,52 @@ mod tests {
 
   #[test]
   fn binds_mount_points_read_only_with_slave_propagation() {
-    let document = mount_override(&[(Path::new("/run/user/1000/docker-vm/p.mounts/0"), "/home/desktop/assets")]).unwrap();
+    let document = mount_override(&[BindMount { source: Path::new("/run/user/1000/docker-vm/p.mounts/0"), target: "/home/desktop/assets", read_only: true }]).unwrap();
     assert_eq!(
       document,
       r#"{"services":{"desktop":{"volumes":[{"type":"bind","source":"/run/user/1000/docker-vm/p.mounts/0","target":"/home/desktop/assets","read_only":true,"bind":{"propagation":"rslave","create_host_path":false}}]}}}"#,
     );
+  }
+
+  #[test]
+  fn drop_zone_override_follows_each_tier() {
+    let point = Path::new("/run/user/1000/docker-vm/p.mounts/live");
+    assert!(drop_zone_bind(SharingTier::Off, point).is_none());
+    for tier in [SharingTier::Encrypted, SharingTier::Ro, SharingTier::Rw] {
+      let document = mount_override(&[drop_zone_bind(tier, point).unwrap()]).unwrap();
+      let value: serde_json::Value = serde_json::from_str(&document).unwrap();
+      let bind = &value["services"]["desktop"]["volumes"][0];
+      assert_eq!(bind["source"], point.to_str().unwrap());
+      assert_eq!(bind["target"], "/home/desktop/mnt");
+      assert_eq!(bind["read_only"], tier != SharingTier::Rw);
+      assert_eq!(bind["bind"]["propagation"], "rslave");
+      assert_eq!(bind["bind"]["create_host_path"], false);
+    }
+  }
+
+  #[test]
+  fn name_sanitizing_and_deduplication_stay_inside_drop_zone() {
+    assert_eq!(sanitize_name(Path::new("/home/me/a b?.zip")), "a_b_.zip");
+    assert_eq!(sanitize_name(Path::new("/")), "share");
+    assert_eq!(unique_name("docs", ["docs", "docs-2"].into_iter()), "docs-3");
+    assert_eq!(unique_name("docs", ["other"].into_iter()), "docs");
+  }
+
+  #[test]
+  fn no_propagation_disables_only_live_sharing() {
+    let private = Err("runtime mount is private".into());
+    assert_eq!(live_unavailable(SharingTier::Ro, false, &private).as_deref(), Some("runtime mount is private"));
+    assert_eq!(live_unavailable(SharingTier::Off, false, &private), None);
+    assert_eq!(live_unavailable(SharingTier::Rw, true, &Ok(())).as_deref(), Some("a startup archive already uses ~/mnt"));
+  }
+
+  #[test]
+  fn tightening_limits_new_mounts() {
+    assert!(tier_allows(SharingTier::Encrypted, LiveKind::EncryptedArchive, false));
+    assert!(!tier_allows(SharingTier::Encrypted, LiveKind::Folder, false));
+    assert!(!tier_allows(SharingTier::Ro, LiveKind::Folder, true));
+    assert!(tier_allows(SharingTier::Rw, LiveKind::Folder, true));
+    assert!(!tier_allows(SharingTier::Rw, LiveKind::Archive, true));
+    assert_eq!(SharingTier::Rw.restrict(SharingTier::Ro), SharingTier::Ro);
   }
 }

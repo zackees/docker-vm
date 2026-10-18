@@ -30,6 +30,11 @@ pub enum SharingTier {
 }
 
 impl SharingTier {
+  pub fn restrict(self, saved: Self) -> Self {
+    let rank = |tier| match tier { Self::Off => 0, Self::Encrypted => 1, Self::Ro => 2, Self::Rw => 3 };
+    if rank(self) <= rank(saved) { self } else { saved }
+  }
+
   pub fn effective(saved: Self) -> Self {
     std::env::var("DOCKER_VM_FILE_SHARING").ok()
       .and_then(|value| serde_json::from_value::<Self>(serde_json::Value::String(value)).ok())
