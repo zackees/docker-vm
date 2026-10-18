@@ -21,5 +21,5 @@ main { display: flex; align-items: center; justify-content: center; }
 #settings label { display: block; margin: 3px 0; }
 #settings fieldset.greyed label { color: #777; }
 #settings .unavailable { margin: 4px 0 0; color: #c9a26b; font-size: 12px; }
-#settings-note, #settings-overrides, #file-sharing-note, #file-sharing-running { margin: 6px 0; color: #999; font-size: 12px; }
+#settings-note, #settings-overrides, #file-sharing-note, #file-sharing-running, #file-sharing-status { margin: 6px 0; color: #999; font-size: 12px; }
 #settings-restart { padding: 4px 10px; border: 1px solid #555; border-radius: 6px; background: #333; color: #ddd; cursor: pointer; }

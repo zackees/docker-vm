@@ -35,10 +35,16 @@ export function settingsPanel(document) {
     const labels = { off: 'Off', encrypted: 'Encrypted archives only', ro: 'Read-only', rw: 'Read & write' };
     document.querySelector('#file-sharing-running').textContent =
       `Running session: ${labels[view.effective_file_sharing]}; saved setting: ${labels[view.settings.file_sharing]}.`;
+    const sharing = view.sharing_status;
+    document.querySelector('#file-sharing-status').textContent = sharing.unavailable
+      ? `Sharing unavailable: ${sharing.unavailable}`
+      : sharing.allowed_now === 'off' ? 'No folders shared.'
+        : sharing.mounts.length ? `Shared now: ${sharing.mounts.join(', ')}.` : 'Available but not active: no folders shared.';
   }
 
   async function refresh() {
     view = await invoke('settings_view');
+    view.sharing_status = await invoke('sharing_status');
     for (const name of Object.keys(groups)) {
       groups[name].querySelector(`input[value="${view.settings[name]}"]`).checked = true;
     }
@@ -50,9 +56,16 @@ export function settingsPanel(document) {
   for (const group of Object.values(groups)) {
     group.addEventListener('change', async () => {
       const settings = { gpu: chosen('gpu'), wayland: chosen('wayland'), video: chosen('video'), file_sharing: chosen('file_sharing') };
-      await invoke('save_settings', { gpu: settings.gpu, wayland: settings.wayland,
-        video: settings.video, fileSharing: settings.file_sharing });
+      try {
+        await invoke('save_settings', { gpu: settings.gpu, wayland: settings.wayland,
+          video: settings.video, fileSharing: settings.file_sharing });
+      } catch (error) {
+        await refresh();
+        document.querySelector('#file-sharing-status').textContent = `Settings change could not finish: ${error}`;
+        return;
+      }
       view.settings = settings;
+      view.sharing_status = await invoke('sharing_status');
       render();
     });
   }

@@ -55,7 +55,7 @@ fn main() {
     .manage(audio)
     .invoke_handler(tauri::generate_handler![status, connection, set_display_scale, set_display_size, stats_enabled, report_stats, rfb_tuning, video_event,
       native_video_start, native_video_state, native_video_place, native_audio_start,
-      native_video_hidden, native_controls, settings_view, save_settings, restart_session])
+      native_video_hidden, native_controls, settings_view, sharing_status, save_settings, restart_session])
     .setup(move |app| {
       let window = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
         .title("Private desktop canvas")
@@ -176,10 +176,20 @@ fn settings_view(manager: tauri::State<'_, Arc<SessionManager>>) -> settings::Se
   manager.settings_view()
 }
 
-/// Saves the choices; they apply when the next session starts.
 #[tauri::command]
-fn save_settings(gpu: settings::Mode, wayland: settings::Mode, video: settings::Mode, file_sharing: settings::SharingTier) -> Result<(), String> {
-  settings::save(settings::Settings { gpu, wayland, video, file_sharing })
+fn sharing_status(manager: tauri::State<'_, Arc<SessionManager>>) -> session::SharingStatus {
+  manager.sharing_status()
+}
+
+/// Saves the choices. A lower sharing tier takes effect immediately; GPU,
+/// desktop, video and wider sharing choices need the next session.
+#[tauri::command]
+async fn save_settings(manager: tauri::State<'_, Arc<SessionManager>>, gpu: settings::Mode, wayland: settings::Mode, video: settings::Mode, file_sharing: settings::SharingTier) -> Result<(), String> {
+  let manager = Arc::clone(&manager);
+  tokio::task::spawn_blocking(move || {
+    settings::save(settings::Settings { gpu, wayland, video, file_sharing })?;
+    manager.apply_sharing_tier()
+  }).await.map_err(|error| error.to_string())?
 }
 
 /// Ends this session (container removed) and relaunches the viewer, which
