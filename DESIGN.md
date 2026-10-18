@@ -42,6 +42,13 @@ profile are tmpfs mounts. The host bind mount holds only the generated password
 file in the viewer-verified `XDG_RUNTIME_DIR` tmpfs directory and is read-only in
 the container.
 
+A folder mounted through Read & write file sharing with **Allow changes** is
+the deliberate exception: files changed in that host folder persist after the
+session ends. The tier and per-mount choice must both allow writes. Directory
+FUSE walks use directory file descriptors and `O_NOFOLLOW` at every component;
+the mount remains owner-only, `nodev`, `nosuid`, and `noexec`. New files cannot
+receive executable bits from the container.
+
 ## GPU rendering
 
 GPU rendering is automatic. At launch, off the UI thread, the viewer checks that
@@ -114,7 +121,7 @@ In GPU mode the viewer therefore starts a Wayland desktop instead
 stays opt-in because reading its framebuffer back for VNC or capture is slower
 than Xtigervnc.
 
-Archive mounts are opt-in (`--mount type=zip`) and are the only other host binds.
+Startup archive mounts are opt-in (`--mount type=zip`).
 Each binds an empty directory beside the session directory read-only with
 `rslave` propagation; after `compose up`, the viewer mounts a FUSE view of the
 archive on that directory. Decryption happens in the viewer process on each
@@ -125,6 +132,14 @@ read it, and Docker never has to access it. Passwords come from a 0600 file,
 standard input, or a dialog, are verified before the container starts, and are
 zeroed when dropped. Archive paths are sanitized: absolute and `..` entries and
 symlinks are not exposed.
+
+For live file sharing, the viewer binds an initially empty tmpfs drop zone to
+`/home/desktop/mnt` when sharing is enabled: read-only for Encrypted and
+Read-only, writable only for Read & write. Live folder mounts are FUSE views
+under that zone, read-only unless the user explicitly allows changes. The
+container cannot name a host path to mount; that choice belongs to the native
+viewer. If the host runtime mount cannot propagate later FUSE mounts, the
+desktop still starts without live sharing.
 
 The native WebKitGTK shell loads only the local viewer UI and uses an
 off-the-record request context. Chromium inside the desktop container keeps its
