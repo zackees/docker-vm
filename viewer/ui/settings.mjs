@@ -12,10 +12,11 @@ export function settingsPanel(document) {
     gpu: document.querySelector('#gpu-setting'),
     wayland: document.querySelector('#wayland-setting'),
     video: document.querySelector('#video-setting'),
+    file_sharing: document.querySelector('#file-sharing-setting'),
   };
   let view = null;
 
-  const chosen = name => groups[name].querySelector('input:checked')?.value ?? 'auto';
+  const chosen = name => groups[name].querySelector('input:checked')?.value ?? (name === 'file_sharing' ? 'ro' : 'auto');
 
   function render() {
     for (const [name, unavailable] of [['gpu', view.gpu_unavailable], ['wayland', view.wayland_unavailable],
@@ -31,6 +32,9 @@ export function settingsPanel(document) {
     }
     overrides.hidden = view.overrides.length === 0;
     overrides.textContent = `Overridden for this launch by ${view.overrides.join(', ')}.`;
+    const labels = { off: 'Off', encrypted: 'Encrypted archives only', ro: 'Read-only', rw: 'Read & write' };
+    document.querySelector('#file-sharing-running').textContent =
+      `Running session: ${labels[view.effective_file_sharing]}; saved setting: ${labels[view.settings.file_sharing]}.`;
   }
 
   async function refresh() {
@@ -45,8 +49,9 @@ export function settingsPanel(document) {
 
   for (const group of Object.values(groups)) {
     group.addEventListener('change', async () => {
-      const settings = { gpu: chosen('gpu'), wayland: chosen('wayland'), video: chosen('video') };
-      await invoke('save_settings', settings);
+      const settings = { gpu: chosen('gpu'), wayland: chosen('wayland'), video: chosen('video'), file_sharing: chosen('file_sharing') };
+      await invoke('save_settings', { gpu: settings.gpu, wayland: settings.wayland,
+        video: settings.video, fileSharing: settings.file_sharing });
       view.settings = settings;
       render();
     });

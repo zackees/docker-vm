@@ -178,8 +178,8 @@ fn settings_view(manager: tauri::State<'_, Arc<SessionManager>>) -> settings::Se
 
 /// Saves the choices; they apply when the next session starts.
 #[tauri::command]
-fn save_settings(gpu: settings::Mode, wayland: settings::Mode, video: settings::Mode) -> Result<(), String> {
-  settings::save(settings::Settings { gpu, wayland, video })
+fn save_settings(gpu: settings::Mode, wayland: settings::Mode, video: settings::Mode, file_sharing: settings::SharingTier) -> Result<(), String> {
+  settings::save(settings::Settings { gpu, wayland, video, file_sharing })
 }
 
 /// Ends this session (container removed) and relaunches the viewer, which
