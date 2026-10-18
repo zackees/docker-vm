@@ -113,6 +113,13 @@ Off, Encrypted archives only, Read-only (default), or Read & write. In Read &
 write, folders stay read-only unless you choose **Allow changes** for that
 mount. ZIP archives are always read-only. The Encrypted tier accepts only ZIPs
 whose every file is encrypted. Changing to a wider tier needs a session restart.
+Tick **Remember this share** in the picker to list its path under **File →
+Mount → Recent** for later sessions. Recent shares stay inactive until chosen;
+encrypted archives ask for their password each time. **Forget all** clears the
+list. Saving a share never saves its password or exposes its files at startup.
+Changing to a stricter tier limits new mounts immediately, and Off unmounts
+current shares. The `DOCKER_VM_FILE_SHARING` environment variable can set a
+tier for one launch.
 
 ### Read-only archive mounts
 
