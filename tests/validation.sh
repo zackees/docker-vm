@@ -27,7 +27,10 @@ grep -q 'ensure_tmpfs' "$root/viewer/src-tauri/src/session.rs"
 grep -q 'create_new(true)' "$root/viewer/src-tauri/src/session.rs"
 grep -q 'MountOption::RO' "$root/viewer/src-tauri/src/zipfs.rs"
 if grep -qE 'AllowOther|AllowRoot|SessionACL::(All|RootAndOwner)|allow_other|allow_root' "$root/viewer/src-tauri/src/zipfs.rs"; then echo 'archive mount must stay owner-only' >&2; exit 1; fi
-grep -q '"read_only":true,"bind":{{"propagation":"rslave"' "$root/viewer/src-tauri/src/session.rs"
+# Archive binds stay read-only; the live drop zone chooses ro/rw from its tier.
+grep -Fq 'read_only: true' "$root/viewer/src-tauri/src/session.rs"
+grep -Fq 'read_only: tier != SharingTier::Rw' "$root/viewer/src-tauri/src/session.rs"
+grep -Fq '"read_only":{},"bind":{{"propagation":"rslave"' "$root/viewer/src-tauri/src/session.rs"
 bash -n "$root/scripts/preflight" "$root/images/desktop/ephemeral-session" "$root/scripts/build" "$root/viewer/launch"
 node --test "$root/tests/physical-pixels.mjs" "$root/tests/video-transport.mjs"
 python3 "$root/tests/display-scale.py"
