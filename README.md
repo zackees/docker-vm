@@ -103,6 +103,17 @@ loader can fail silently. The viewer creates one fresh Docker Compose project,
 an in-memory VNC password, and an authenticated loopback bridge. Closing it
 removes only that project.
 
+### Live file sharing
+
+Use the native **File** menu while the desktop is running to mount a host
+folder or ZIP archive at `~/mnt/<name>`. **Unmount** removes it without
+restarting the desktop; **Quit** ends the session. Nothing is shared until you
+choose a source. The File sharing setting controls what the menu permits:
+Off, Encrypted archives only, Read-only (default), or Read & write. In Read &
+write, folders stay read-only unless you choose **Allow changes** for that
+mount. ZIP archives are always read-only. The Encrypted tier accepts only ZIPs
+whose every file is encrypted. Changing to a wider tier needs a session restart.
+
 ### Read-only archive mounts
 
 A ZIP archive, including a password-protected one, can be exposed inside the

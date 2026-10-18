@@ -140,6 +140,11 @@ under that zone, read-only unless the user explicitly allows changes. The
 container cannot name a host path to mount; that choice belongs to the native
 viewer. If the host runtime mount cannot propagate later FUSE mounts, the
 desktop still starts without live sharing.
+The native File menu alone opens GTK pickers for host paths; the webview has no
+path-accepting mount command. Menu items reflect the current tier and runtime
+availability. ZIPs use the same decrypt-on-read FUSE view as startup mounts,
+and the Encrypted tier checks every file entry before mounting. Unmount releases
+the live FUSE mount, while Quit follows the window-close cleanup path.
 
 The native WebKitGTK shell loads only the local viewer UI and uses an
 off-the-record request context. Chromium inside the desktop container keeps its

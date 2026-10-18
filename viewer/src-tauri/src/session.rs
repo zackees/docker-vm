@@ -20,6 +20,7 @@ use tokio_tungstenite::{accept_hdr_async, tungstenite::{handshake::server::{Requ
 use uuid::Uuid;
 
 use crate::{
+  dirfs::{self, DirFs},
   settings::{self, HostSupport, Mode, Settings, SettingsView, SharingTier},
   mounts::{Options, ZipMount},
   zipfs::{self, Archive, Password, ZipFs},
@@ -58,7 +59,7 @@ struct LiveMount {
   session: BackgroundSession,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct SharingStatus {
   pub effective: SharingTier,
   pub allowed_now: SharingTier,
@@ -393,6 +394,13 @@ impl SessionManager {
     let owner = self.root.metadata().map_err(|error| error.to_string())?;
     self.mount_live(source, kind, false, move |_, point| {
       zipfs::mount(ZipFs::new(archive, password, owner.uid(), owner.gid()), point)
+    })
+  }
+
+  /// Shares a picker-selected folder; the tier check remains in mount_live.
+  pub fn mount_folder_live(&self, source: PathBuf, writable: bool) -> Result<String, String> {
+    self.mount_live(source, LiveKind::Folder, writable, move |source, point| {
+      dirfs::mount(DirFs::new(source, writable)?, point)
     })
   }
 
