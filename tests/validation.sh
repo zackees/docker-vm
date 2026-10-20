@@ -35,5 +35,6 @@ grep -Fq '"read_only":{},"bind":{{"propagation":"rslave"' "$root/viewer/src-taur
 bash -n "$root/scripts/preflight" "$root/images/desktop/ephemeral-session" "$root/scripts/build" "$root/viewer/launch"
 node --test "$root/tests/physical-pixels.mjs" "$root/tests/video-transport.mjs"
 python3 "$root/tests/display-scale.py"
+python3 "$root/tests/wayland-output.py"
 SESSION_RUNTIME_DIR=/tmp SESSION_UID=1000 SESSION_GID=1000 docker compose -f "$root/compose.yaml" config >/dev/null
 echo 'validation behavior tests: PASS'

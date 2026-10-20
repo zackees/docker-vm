@@ -203,6 +203,7 @@ class Output:
                 temporary = self.generation_file.with_suffix(".next")
                 temporary.write_text(str(self.generation))
                 temporary.rename(self.generation_file)
+                refresh_hidden_panels(self.env)
             self.observed = current
 
     def poll(self) -> None:
@@ -220,6 +221,29 @@ class Output:
 def set_mode(env: dict[str, str], mode: OutputMode) -> subprocess.CompletedProcess:
     return subprocess.run(["wlr-randr", "--output", OUTPUT, "--custom-mode", f"{mode.width}x{mode.height}",
                            "--scale", str(mode.scale)], env=env, capture_output=True, text=True)
+
+
+def refresh_hidden_panels(env: dict[str, str]) -> None:
+    """Recreate Xfce's reveal strips after an output geometry/scale change.
+
+    Xfce 4.20.4 leaves a hidden panel's layer surface at the previous output
+    edge. Reapplying autohide recreates it against the current monitor. Keep
+    each panel's configured behavior, including user-created panels.
+    """
+    try:
+        result = subprocess.run(["xfconf-query", "-c", "xfce4-panel", "-lv"],
+                                env=env, capture_output=True, text=True, timeout=2)
+        if result.returncode != 0:
+            return  # The panel may not have initialized its configuration yet.
+        for key, behavior in re.findall(r"^(/panels/panel-\d+/autohide-behavior)\s+([12])\s*$",
+                                        result.stdout, re.MULTILINE):
+            command = ["xfconf-query", "-c", "xfce4-panel", "-p", key, "-s"]
+            try:
+                subprocess.run([*command, "0"], env=env, capture_output=True, timeout=2, check=True)
+            finally:
+                subprocess.run([*command, behavior], env=env, capture_output=True, timeout=2, check=True)
+    except (OSError, subprocess.SubprocessError) as error:
+        log(f"could not refresh hidden panels: {error}")
 
 
 def main() -> int:
