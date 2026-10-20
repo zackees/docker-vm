@@ -96,14 +96,7 @@ class WaylandLab(Lab):
                     process.wait(timeout=15)
 
 
-def exercise(lab: WaylandLab) -> None:
-    session = lab.start("wayland-menu", "ro", gpu=True)
-    until(lambda: "native video: first frame presented" in session.output(), "native GPU video did not present", 60)
-    parent_id = lab.window("Private desktop canvas")
-    require(bool(parent_id), "viewer window was not mapped")
-    lab.kwin("windowmove", parent_id, "0", "0")
-    lab.kwin("windowsize", parent_id, "900", "650")
-    time.sleep(1)
+def exercise_file_menu(lab: WaylandLab, session, parent_id: str) -> None:
     parent = lab.rectangle(parent_id)
 
     picker = lab.open_picker()
@@ -140,6 +133,18 @@ def exercise(lab: WaylandLab) -> None:
     lab.screenshot("wayland-after-mount-ack")
     lab.note("Wayland mount", "selected folder hot-mounted through the native picker")
 
+
+def exercise(lab: WaylandLab, dock_only: bool = False) -> None:
+    session = lab.start("wayland-menu", "ro", gpu=True)
+    until(lambda: "native video: first frame presented" in session.output(), "native GPU video did not present", 60)
+    parent_id = lab.window("Private desktop canvas")
+    require(bool(parent_id), "viewer window was not mapped")
+    lab.kwin("windowmove", parent_id, "0", "0")
+    lab.kwin("windowsize", parent_id, "900", "650")
+    time.sleep(1)
+    if not dock_only:
+        exercise_file_menu(lab, session, parent_id)
+
     # A small centered button makes stale RFB pointer dimensions observable:
     # the video can look correct while clicks map outside the visible button.
     page = (b'<body style="margin:0;background:#334455"><button style="position:fixed;'
@@ -171,6 +176,24 @@ def exercise(lab: WaylandLab) -> None:
     require(session.exec("cat", "/tmp/viewer-pointer-request").stdout == "/input-ok", "unexpected browser request")
     lab.screenshot("wayland-remote-input")
     lab.note("Wayland input", "remote Chromium received keyboard input and a precise button click after two live resizes")
+    # Grow past the initial output size. Xfce 4.20.4 can leave its hidden
+    # dock's reveal strip at the old bottom edge, over the page contents.
+    lab.kwin("windowsize", parent_id, "1300", "900")
+    time.sleep(2)
+    screenshot = lab.screenshot("wayland-grown-desktop")
+    pixels = subprocess.run(["convert", str(screenshot), "-crop", "1240x670+30+200",
+                             "-depth", "8", "RGB:-"], capture_output=True, check=True).stdout
+    longest = run = background = 0
+    for offset in range(0, len(pixels), 3):
+        if offset % (1240 * 3) == 0:
+            run = 0
+        r, g, b = pixels[offset:offset + 3]
+        background += abs(r - 51) < 12 and abs(g - 68) < 12 and abs(b - 85) < 12
+        run = run + 1 if min(r, g, b) > 180 and max(r, g, b) - min(r, g, b) < 20 else 0
+        longest = max(longest, run)
+    require(background > 1240 * 670 * 0.9, "resized video did not show the probe background")
+    require(longest < 250, f"stray dock edge across the page after resize: {longest} bright pixels")
+    lab.note("Wayland dock", "no floating dock edge after growing beyond the original output size")
     session.stop("signal")
 
 
@@ -179,6 +202,7 @@ def main() -> None:
     parser.add_argument("--viewer", type=Path, required=True)
     parser.add_argument("--workdir", type=Path, required=True)
     parser.add_argument("--display", default=":196")
+    parser.add_argument("--dock-only", action="store_true", help="run resize/input/dock checks without file pickers")
     args = parser.parse_args()
     require(args.workdir.is_dir() and args.viewer.is_file(), "viewer and workdir must exist")
     require(f"/run/user/{os.getuid()}/bus" not in os.environ.get("DBUS_SESSION_BUS_ADDRESS", ""),
@@ -197,7 +221,7 @@ def main() -> None:
     require(result.returncode == 0, f"could not isolate D-Bus service activation: {result.stderr}")
     try:
         lab.start_display()
-        exercise(lab)
+        exercise(lab, args.dock_only)
     finally:
         lab.cleanup()
 
